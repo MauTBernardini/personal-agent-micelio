@@ -1,0 +1,7 @@
+.env
+gmail_credentials.json
+gmail_token.json
+personal-assets/
+__pycache__/
+*.pyc
+chroma_db/
