@@ -9,6 +9,7 @@ from __future__ import annotations
 import streamlit as st
 
 from core_agent import (
+    LLMProviderError,
     get_connection_status,
     get_dashboard_metrics,
     get_manual_review_categories,
@@ -31,13 +32,20 @@ def render_sidebar() -> None:
     st.sidebar.title("Controle do Agente")
 
     if st.sidebar.button("Rodar Triagem", use_container_width=True, type="primary"):
-        with st.spinner("Executando o fluxo LangGraph e processando a caixa de entrada..."):
-            results = run_triage_workflow()
+        try:
+            with st.spinner("Executando o fluxo LangGraph e processando a caixa de entrada..."):
+                results = run_triage_workflow()
 
-        if results:
-            st.sidebar.success(f"Triagem concluída: {len(results)} novo(s) e-mail(s) processado(s).")
-        else:
-            st.sidebar.info("Nenhum novo e-mail para processar no mock no momento.")
+            if results:
+                st.sidebar.success(f"Triagem concluída: {len(results)} novo(s) e-mail(s) processado(s).")
+            else:
+                st.sidebar.info("Nenhum novo e-mail para processar no provider ativo no momento.")
+        except LLMProviderError as exc:
+            st.sidebar.error(f"Falha no provider LLM: {exc}")
+            st.error(f"Falha no provider LLM selecionado: {exc}")
+        except Exception as exc:
+            st.sidebar.error(f"Erro na triagem: {exc}")
+            st.error(f"Erro durante a triagem: {exc}")
 
     st.sidebar.divider()
     st.sidebar.subheader("Status das conexões")
@@ -111,8 +119,8 @@ def main() -> None:
     st.title("Agente Pessoal de Triagem de E-mails")
     st.caption(
         "MVP agentic com LangGraph, memória transacional em PostgreSQL dockerizado, "
-        "memória semântica em ChromaDB e camada de provedor LLM com fallback "
-        "heurístico local."
+        "memória semântica em ChromaDB e erro explícito no front quando o "
+        "provider LLM selecionado não estiver operacional."
     )
 
     render_metrics()

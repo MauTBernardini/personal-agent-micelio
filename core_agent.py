@@ -3,7 +3,7 @@
 This module intentionally centralizes:
 - PostgreSQL persistence
 - ChromaDB semantic memory
-- LLM provider abstraction (OpenAI / Anthropic / fallback)
+- LLM provider abstraction (Gemini / OpenAI / Anthropic / fallback)
 - LangGraph orchestration
 - Gmail API mocks for local testing
 
@@ -18,6 +18,7 @@ import os
 import re
 import uuid
 from dataclasses import dataclass
+from datetime import datetime
 from html import unescape
 from pathlib import Path
 from typing import Any, Final, TypedDict, cast
@@ -44,6 +45,13 @@ except ImportError:  # pragma: no cover - keeps local MVP usable without the SDK
     OpenAI = None  # type: ignore[assignment]
 
 try:
+    from google import genai
+    from google.genai import types as genai_types
+except ImportError:  # pragma: no cover - keeps local MVP usable without the SDK installed.
+    genai = None  # type: ignore[assignment]
+    genai_types = None  # type: ignore[assignment]
+
+try:
     from google.auth.transport.requests import Request as GoogleAuthRequest
     from google.oauth2.credentials import Credentials as GoogleCredentials
     from google_auth_oauthlib.flow import InstalledAppFlow
@@ -62,15 +70,19 @@ CHROMA_PATH: Final[Path] = BASE_DIR / "chroma_db"
 CHROMA_COLLECTION_NAME: Final[str] = "semantic_memory"
 ANTHROPIC_MODEL: Final[str] = "claude-3-haiku-20240307"
 OPENAI_MODEL: Final[str] = "gpt-5-mini"
+GEMINI_MODEL: Final[str] = "gemini-2.5-flash-lite"
 DEFAULT_DATABASE_URL: Final[str] = (
     "postgresql://micelio:micelio@localhost:5432/email_agent"
 )
 ENV_FILE_PATH: Final[Path] = BASE_DIR / ".env"
-DEFAULT_LLM_PROVIDER: Final[str] = "openai"
+DEFAULT_LLM_PROVIDER: Final[str] = "gemini"
 DEFAULT_EMAIL_PROVIDER: Final[str] = "mock"
 DEFAULT_GMAIL_USER_ID: Final[str] = "me"
-DEFAULT_GMAIL_QUERY: Final[str] = "in:inbox"
-DEFAULT_GMAIL_MAX_RESULTS: Final[int] = 10
+DEFAULT_GMAIL_QUERY: Final[str] = ""
+DEFAULT_GMAIL_MAX_RESULTS: Final[int] = 0
+DEFAULT_GMAIL_PAGE_SIZE: Final[int] = 100
+DEFAULT_GMAIL_AFTER_DATE: Final[str] = "today"
+DEFAULT_GMAIL_REQUIRE_INBOX: Final[bool] = True
 DEFAULT_GMAIL_OAUTH_PORT: Final[int] = 8765
 DEFAULT_GMAIL_LABEL_PREFIX: Final[str] = "AUTO_TRIAGEM_"
 DEFAULT_GMAIL_ARCHIVE_AFTER_TRIAGE: Final[bool] = False
@@ -132,21 +144,30 @@ Produza um resumo factual em 1 parágrafo, em português do Brasil, sem inventar
 def load_local_env_file() -> None:
     """Load key-value pairs from a local .env file without extra dependencies.
 
-    Existing environment variables always win, which keeps shell overrides predictable.
+    Explicit environment variables with a non-empty value still win, but blank values
+    are replaced by the local `.env`. This is important for Streamlit and similar
+    launchers that may propagate empty variables into the process.
     """
 
-    if not ENV_FILE_PATH.exists():
+    candidate_paths = [ENV_FILE_PATH, Path.cwd() / ".env"]
+    env_path = next((path for path in candidate_paths if path.exists()), None)
+    if env_path is None:
         return
 
-    for raw_line in ENV_FILE_PATH.read_text(encoding="utf-8").splitlines():
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
 
+        if line.startswith("export "):
+            line = line[len("export ") :].strip()
+
         key, value = line.split("=", 1)
         normalized_key = key.strip()
         normalized_value = value.strip().strip('"').strip("'")
-        os.environ.setdefault(normalized_key, normalized_value)
+        current_value = os.getenv(normalized_key)
+        if current_value is None or not current_value.strip():
+            os.environ[normalized_key] = normalized_value
 
 
 class EmailAgentState(TypedDict):
@@ -158,6 +179,10 @@ class EmailAgentState(TypedDict):
 
 
 load_local_env_file()
+
+
+class LLMProviderError(RuntimeError):
+    """Raised when the configured LLM provider cannot satisfy a request."""
 
 
 def _get_bool_env(env_name: str, default: bool) -> bool:
@@ -173,13 +198,20 @@ def get_llm_provider() -> str:
     """Return the configured LLM provider strategy.
 
     Supported values:
+    - gemini
     - openai
     - anthropic
     - heuristic
     """
 
     provider = os.getenv("LLM_PROVIDER", DEFAULT_LLM_PROVIDER).strip().lower()
-    return provider if provider in {"openai", "anthropic", "heuristic"} else DEFAULT_LLM_PROVIDER
+    return provider if provider in {"gemini", "openai", "anthropic", "heuristic"} else DEFAULT_LLM_PROVIDER
+
+
+def get_gemini_model_name() -> str:
+    """Return the Gemini model used for classification and summarization."""
+
+    return os.getenv("GEMINI_MODEL", GEMINI_MODEL).strip() or GEMINI_MODEL
 
 
 def get_openai_model_name() -> str:
@@ -257,21 +289,66 @@ def get_gmail_user_id() -> str:
 
 
 def get_gmail_query() -> str:
-    """Return the Gmail search query used to fetch candidate messages."""
+    """Return optional extra Gmail filters appended to the default triage query."""
 
     return os.getenv("GMAIL_QUERY", DEFAULT_GMAIL_QUERY).strip() or DEFAULT_GMAIL_QUERY
 
 
-def get_gmail_max_results(default_limit: int | None = None) -> int:
-    """Resolve Gmail maxResults from the explicit call or the environment."""
+def get_gmail_max_results(default_limit: int | None = None) -> int | None:
+    """Resolve the total Gmail retrieval limit.
+
+    `0` means there is no explicit cap and the workflow should keep paging.
+    """
 
     if default_limit is not None:
         return default_limit
     raw_limit = os.getenv("GMAIL_MAX_RESULTS", str(DEFAULT_GMAIL_MAX_RESULTS)).strip()
     try:
-        return max(1, min(int(raw_limit), 100))
+        parsed_limit = int(raw_limit)
     except ValueError:
         return DEFAULT_GMAIL_MAX_RESULTS
+    if parsed_limit <= 0:
+        return None
+    return parsed_limit
+
+
+def get_gmail_page_size() -> int:
+    """Return the page size used for Gmail API pagination."""
+
+    raw_value = os.getenv("GMAIL_PAGE_SIZE", str(DEFAULT_GMAIL_PAGE_SIZE)).strip()
+    try:
+        return max(1, min(int(raw_value), 500))
+    except ValueError:
+        return DEFAULT_GMAIL_PAGE_SIZE
+
+
+def get_gmail_after_date() -> str | None:
+    """Return the lower date bound for Gmail triage in Gmail query format.
+
+    Accepted values:
+    - `today`: use the current local date
+    - `YYYY-MM-DD` or `YYYY/MM/DD`
+    - empty / `none` / `off`: disable the lower bound
+    """
+
+    raw_value = os.getenv("GMAIL_AFTER_DATE", DEFAULT_GMAIL_AFTER_DATE).strip()
+    normalized_value = raw_value.lower()
+    if not raw_value or normalized_value in {"none", "off", "all"}:
+        return None
+    if normalized_value == "today":
+        return datetime.now().strftime("%Y/%m/%d")
+    for date_format in ("%Y-%m-%d", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(raw_value, date_format).strftime("%Y/%m/%d")
+        except ValueError:
+            continue
+    return datetime.now().strftime("%Y/%m/%d")
+
+
+def should_require_gmail_inbox() -> bool:
+    """Whether Gmail triage should be restricted to messages still in INBOX."""
+
+    return _get_bool_env("GMAIL_REQUIRE_INBOX", DEFAULT_GMAIL_REQUIRE_INBOX)
 
 
 def get_gmail_oauth_port() -> int:
@@ -288,6 +365,21 @@ def get_gmail_label_prefix() -> str:
     """Return the label prefix used for auto-triaged emails in Gmail."""
 
     return os.getenv("GMAIL_LABEL_PREFIX", DEFAULT_GMAIL_LABEL_PREFIX).strip() or DEFAULT_GMAIL_LABEL_PREFIX
+
+
+def build_gmail_triage_query() -> str:
+    """Build the Gmail search query used by the triage workflow."""
+
+    query_parts = ["is:unread"]
+    after_date = get_gmail_after_date()
+    if after_date:
+        query_parts.insert(0, f"after:{after_date}")
+    if should_require_gmail_inbox():
+        query_parts.append("in:inbox")
+    extra_query = get_gmail_query()
+    if extra_query:
+        query_parts.append(extra_query)
+    return " ".join(part for part in query_parts if part).strip()
 
 
 def should_archive_after_triage() -> bool:
@@ -643,37 +735,68 @@ def gmail_move_message_stub(message_id: str, category: str) -> dict[str, Any]:
 
 
 def gmail_list_messages_real(limit: int | None = None) -> list[dict[str, Any]]:
-    """Fetch Gmail inbox messages through the official Gmail API."""
+    """Fetch Gmail messages through the official Gmail API with pagination."""
 
     service = _build_gmail_service()
-    max_results = get_gmail_max_results(limit)
-
-    response = (
-        service.users()
-        .messages()
-        .list(
-            userId=get_gmail_user_id(),
-            maxResults=max_results,
-            q=get_gmail_query(),
-            labelIds=["INBOX"],
-            includeSpamTrash=False,
-        )
-        .execute()
-    )
-
-    raw_messages = cast(list[dict[str, Any]], response.get("messages", []))
     hydrated_messages: list[dict[str, Any]] = []
-    for raw_message in raw_messages:
-        message_id = str(raw_message.get("id", ""))
-        if not message_id:
-            continue
-        full_message = (
-            service.users()
-            .messages()
-            .get(userId=get_gmail_user_id(), id=message_id, format="full")
-            .execute()
+    total_limit = get_gmail_max_results(limit)
+    page_size = get_gmail_page_size()
+    page_token: str | None = None
+    triage_label_prefix = get_gmail_label_prefix()
+    query = build_gmail_triage_query()
+    require_inbox = should_require_gmail_inbox()
+
+    while True:
+        remaining = None if total_limit is None else max(total_limit - len(hydrated_messages), 0)
+        if remaining == 0:
+            break
+
+        current_page_size = page_size if remaining is None else min(page_size, remaining)
+        list_kwargs: dict[str, Any] = {
+            "userId": get_gmail_user_id(),
+            "maxResults": current_page_size,
+            "q": query,
+            "includeSpamTrash": False,
+            "pageToken": page_token,
+        }
+        if require_inbox:
+            list_kwargs["labelIds"] = ["INBOX"]
+        response = cast(
+            dict[str, Any],
+            service.users().messages().list(**list_kwargs).execute(),
         )
-        hydrated_messages.append(_gmail_message_to_email_dict(cast(dict[str, Any], full_message)))
+
+        raw_messages = cast(list[dict[str, Any]], response.get("messages", []))
+        if not raw_messages:
+            break
+
+        for raw_message in raw_messages:
+            message_id = str(raw_message.get("id", ""))
+            if not message_id:
+                continue
+            full_message = (
+                service.users()
+                .messages()
+                .get(userId=get_gmail_user_id(), id=message_id, format="full")
+                .execute()
+            )
+            normalized_message = _gmail_message_to_email_dict(cast(dict[str, Any], full_message))
+            labels = cast(list[str], normalized_message.get("labels", []))
+            if any(label.startswith(triage_label_prefix) for label in labels):
+                continue
+            if _is_already_processed(message_id):
+                continue
+            hydrated_messages.append(normalized_message)
+
+            if total_limit is not None and len(hydrated_messages) >= total_limit:
+                break
+
+        if total_limit is not None and len(hydrated_messages) >= total_limit:
+            break
+
+        page_token = cast(str | None, response.get("nextPageToken"))
+        if not page_token:
+            break
 
     return hydrated_messages
 
@@ -871,6 +994,15 @@ def _openai_client() -> OpenAI | None:
     return OpenAI(api_key=api_key)
 
 
+def _gemini_client() -> Any | None:
+    """Build a Gemini client only when the SDK and API key are available."""
+
+    api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+    if genai is None or not api_key:
+        return None
+    return genai.Client(api_key=api_key)
+
+
 def _anthropic_client() -> Anthropic | None:
     """Build an Anthropic client only when the SDK and key are available."""
 
@@ -898,29 +1030,65 @@ def _extract_openai_output_text(response: Any) -> str:
     return "\n".join(text_fragments).strip()
 
 
+def _invoke_gemini_text(system_prompt: str, user_prompt: str, json_output: bool) -> str:
+    """Execute a Gemini Developer API request using the Google GenAI SDK."""
+
+    client = _gemini_client()
+    if client is None:
+        raise LLMProviderError(
+            "Gemini indisponível: configure `GEMINI_API_KEY` ou `GOOGLE_API_KEY` no .env."
+        )
+    if genai_types is None:
+        raise LLMProviderError(
+            "SDK do Gemini indisponível: instale `google-genai` na virtualenv ativa."
+        )
+
+    config_kwargs: dict[str, Any] = {
+        "system_instruction": system_prompt,
+    }
+    if json_output:
+        config_kwargs["response_mime_type"] = "application/json"
+
+    response = client.models.generate_content(
+        model=get_gemini_model_name(),
+        contents=user_prompt,
+        config=genai_types.GenerateContentConfig(**config_kwargs),
+    )
+    response_text = getattr(response, "text", "")
+    if response_text:
+        return str(response_text).strip()
+    raise LLMProviderError("Gemini retornou uma resposta vazia.")
+
+
 def _invoke_openai_text(system_prompt: str, user_prompt: str, json_output: bool) -> str:
     """Execute an OpenAI Responses API request."""
 
     client = _openai_client()
     if client is None:
-        raise RuntimeError("OpenAI client unavailable. Falling back to another strategy.")
+        raise LLMProviderError(
+            "OpenAI indisponível: configure `OPENAI_API_KEY` no .env e valide o billing da API."
+        )
 
     text_config: dict[str, Any]
+    normalized_user_prompt = user_prompt
     if json_output:
         text_config = {"format": {"type": "json_object"}}
+        normalized_user_prompt = (
+            "Responda em JSON valido seguindo estritamente as instrucoes.\n\n"
+            f"{user_prompt}"
+        )
     else:
         text_config = {"format": {"type": "text"}}
 
     response = client.responses.create(
         model=get_openai_model_name(),
         instructions=system_prompt,
-        input=user_prompt,
-        temperature=0,
+        input=normalized_user_prompt,
         text=text_config,
     )
     raw_output = _extract_openai_output_text(response)
     if not raw_output:
-        raise RuntimeError("OpenAI returned no text output.")
+        raise LLMProviderError("OpenAI retornou uma resposta vazia.")
     return raw_output
 
 
@@ -929,7 +1097,9 @@ def _invoke_anthropic_json(system_prompt: str, user_prompt: str) -> str:
 
     client = _anthropic_client()
     if client is None:
-        raise RuntimeError("Anthropic client unavailable. Falling back to another strategy.")
+        raise LLMProviderError(
+            "Anthropic indisponível: configure `ANTHROPIC_API_KEY` no .env."
+        )
 
     response = client.messages.create(
         model=get_anthropic_model_name(),
@@ -940,7 +1110,7 @@ def _invoke_anthropic_json(system_prompt: str, user_prompt: str) -> str:
     )
     text_blocks = [block.text for block in response.content if getattr(block, "type", "") == "text"]
     if not text_blocks:
-        raise RuntimeError("Anthropic returned no text blocks.")
+        raise LLMProviderError("Anthropic retornou uma resposta vazia.")
     return "\n".join(text_blocks).strip()
 
 
@@ -949,16 +1119,18 @@ def _invoke_llm_text(system_prompt: str, user_prompt: str, json_output: bool) ->
 
     provider = get_llm_provider()
     if provider == "heuristic":
-        raise RuntimeError("Heuristic provider does not support direct LLM invocation.")
+        raise LLMProviderError("O provider `heuristic` nao usa chamada externa de LLM.")
+    if provider == "gemini":
+        return _invoke_gemini_text(system_prompt, user_prompt, json_output=json_output)
     if provider == "openai":
         return _invoke_openai_text(system_prompt, user_prompt, json_output=json_output)
     if provider == "anthropic":
         return _invoke_anthropic_json(system_prompt, user_prompt)
-    raise RuntimeError(f"Unsupported LLM provider: {provider}")
+    raise LLMProviderError(f"LLM provider nao suportado: {provider}")
 
 
 def classify_email_with_llm(email_data: dict[str, Any], rag_context: str) -> dict[str, Any]:
-    """Classify one email using Anthropic, with a safe local fallback."""
+    """Classify one email using the configured LLM provider."""
 
     prompt = f"""
 Contexto semantico recuperado:
@@ -973,12 +1145,14 @@ Corpo: {email_data.get("body", "")}
     if get_llm_provider() == "heuristic":
         return _heuristic_classifier(email_data, rag_context)
 
+    raw_output = _invoke_llm_text(SYSTEM_PROMPT, prompt, json_output=True)
     try:
-        raw_output = _invoke_llm_text(SYSTEM_PROMPT, prompt, json_output=True)
         parsed = _safe_json_loads(raw_output)
-        return _normalize_classification(parsed)
-    except Exception:
-        return _heuristic_classifier(email_data, rag_context)
+    except Exception as exc:
+        raise LLMProviderError(
+            "O provider LLM retornou um payload invalido para classificacao JSON."
+        ) from exc
+    return _normalize_classification(parsed)
 
 
 def summarize_priority_email(email_data: dict[str, Any]) -> str:
@@ -996,13 +1170,7 @@ Corpo: {email_data.get("body", "")}
             f"'{email_data.get('subject', '')}', tratado como item prioritario para acompanhamento."
         )
 
-    try:
-        return _invoke_llm_text(SUMMARY_PROMPT, prompt, json_output=False)
-    except Exception:
-        return (
-            f"Resumo factual: e-mail de '{email_data.get('sender', '')}' com assunto "
-            f"'{email_data.get('subject', '')}', tratado como item prioritario para acompanhamento."
-        )
+    return _invoke_llm_text(SUMMARY_PROMPT, prompt, json_output=False)
 
 
 def upsert_semantic_memory(
@@ -1320,11 +1488,18 @@ def get_connection_status() -> dict[str, str]:
             gmail_status = "DEPENDENCIAS_PENDENTES"
 
     llm_provider = get_llm_provider()
-    if llm_provider == "openai":
-        llm_status = "CONFIGURADO" if os.getenv("OPENAI_API_KEY") else "FALLBACK_HEURISTICO"
+    if llm_provider == "gemini":
+        llm_status = (
+            "CONFIGURADO"
+            if (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY"))
+            else "NAO_CONFIGURADO"
+        )
+        llm_model = get_gemini_model_name()
+    elif llm_provider == "openai":
+        llm_status = "CONFIGURADO" if os.getenv("OPENAI_API_KEY") else "NAO_CONFIGURADO"
         llm_model = get_openai_model_name()
     elif llm_provider == "anthropic":
-        llm_status = "CONFIGURADO" if os.getenv("ANTHROPIC_API_KEY") else "FALLBACK_HEURISTICO"
+        llm_status = "CONFIGURADO" if os.getenv("ANTHROPIC_API_KEY") else "NAO_CONFIGURADO"
         llm_model = get_anthropic_model_name()
     else:
         llm_status = "HEURISTICO"
