@@ -1,4 +1,6 @@
 google-genai==1.16.1
+fastapi==0.116.1
+uvicorn==0.35.0
 streamlit==1.56.0
 langgraph==1.1.6
 chromadb==1.5.7

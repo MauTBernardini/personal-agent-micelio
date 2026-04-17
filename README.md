@@ -9,6 +9,7 @@ O projeto agora lê automaticamente um arquivo local `.env` na raiz.
 Arquivo criado neste repositório:
 
 ```env
+AGENT_API_BASE_URL=http://127.0.0.1:8000
 LLM_PROVIDER=gemini
 GEMINI_API_KEY=
 GEMINI_MODEL=gemini-2.5-flash-lite
@@ -46,6 +47,7 @@ GMAIL_OAUTH_PORT=8765
 
 Preencha:
 
+- `AGENT_API_BASE_URL`: URL base da FastAPI consumida pelo Streamlit.
 - `LLM_PROVIDER`: `gemini`, `openai`, `anthropic` ou `heuristic`.
 - `GEMINI_API_KEY`: chave da Gemini Developer API, criada no Google AI Studio.
 - `GEMINI_MODEL`: modelo Gemini para classificação e resumo. Recomendação inicial: `gemini-2.5-flash-lite`.
@@ -186,10 +188,8 @@ source .venv/bin/activate
 Instale pelo menos os pacotes abaixo:
 
 ```bash
-pip install google-genai streamlit langgraph chromadb "psycopg[binary]" openai anthropic google-api-python-client google-auth-httplib2 google-auth-oauthlib
+pip install -r requirements.txt
 ```
-
-Se quiser congelar isso depois, podemos gerar um `requirements.txt` na próxima iteração.
 
 ### 5. Configurar a conexão real com Gmail
 
@@ -274,16 +274,17 @@ Documentação oficial:
 - API keys: https://ai.google.dev/gemini-api/docs/api-key
 - Pricing: https://ai.google.dev/pricing
 
-### 7. Primeiro teste do core
+### 7. Primeiro teste do core e da API
 
 Esse teste valida se:
 
 - o `.env` foi lido;
 - o PostgreSQL está acessível;
 - a tabela `processed_emails` foi criada;
-- o fluxo agentic consegue processar os e-mails do provider ativo.
+- o fluxo agentic consegue processar os e-mails do provider ativo;
+- a FastAPI sobe corretamente e expõe o backend para o Streamlit.
 
-Rode:
+Smoke test direto do core:
 
 ```bash
 python3 -c "from core_agent import run_triage_workflow; print(run_triage_workflow())"
@@ -297,9 +298,27 @@ Resultado esperado:
 
 Se `EMAIL_PROVIDER=gmail`, a primeira execução deve pedir consentimento OAuth.
 
-Se a chave do provider LLM configurado estiver ausente, o teste continua funcionando via fallback local.
+Para subir o backend HTTP:
+
+```bash
+uvicorn api_server:app --reload
+```
+
+Você pode validar rapidamente a API em:
+
+```text
+http://127.0.0.1:8000/health
+```
+
+Resposta esperada:
+
+```json
+{"status":"ok"}
+```
 
 ### 8. Subir a interface Streamlit
+
+Com a API já rodando em outro terminal:
 
 ```bash
 streamlit run app_streamlit.py
@@ -310,8 +329,9 @@ Ao abrir a interface, valide:
 - a sidebar mostra `PostgreSQL: OK`;
 - a sidebar mostra `Gmail: MOCK` ou `Gmail: CONFIGURADO`;
 - a sidebar mostra o provider LLM ativo, o status e o modelo;
-- o botão `Rodar Triagem` processa os e-mails do provider ativo;
+- o botão `Rodar Triagem` processa os e-mails do provider ativo via FastAPI;
 - as métricas sobem após a execução;
+- a seção de categorização mostra o acumulado e a última execução;
 - a `Fila de Revisão Manual` exibe itens `EM_DUVIDA`, quando houver;
 - reclassificações manuais atualizam o PostgreSQL e alimentam o ChromaDB.
 
