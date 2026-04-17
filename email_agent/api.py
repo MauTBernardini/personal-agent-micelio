@@ -14,6 +14,8 @@ from email_agent.service import (
     build_dashboard_payload,
     get_connection_status,
     get_manual_review_categories,
+    get_manual_review_priorities,
+    get_processed_emails,
     get_review_queue,
     manual_reclassify_email,
     run_triage_and_collect,
@@ -22,6 +24,7 @@ from email_agent.service import (
 
 class ReclassifyPayload(BaseModel):
     category: str
+    priority_level: str = "MEDIA"
 
 
 app = FastAPI(
@@ -59,6 +62,9 @@ def triage(limit: int | None = Query(default=None, ge=1)) -> dict[str, Any]:
     try:
         return run_triage_and_collect(limit=limit)
     except LLMProviderError as exc:
+        message = str(exc).lower()
+        if "cota" in message or "quota" in message or "rate limit" in message:
+            raise HTTPException(status_code=429, detail=str(exc)) from exc
         raise HTTPException(status_code=424, detail=str(exc)) from exc
 
 
@@ -67,16 +73,30 @@ def review_queue() -> list[dict[str, Any]]:
     return get_review_queue()
 
 
+@app.get("/processed-emails")
+def processed_emails(limit: int = Query(default=50, ge=1, le=200)) -> list[dict[str, Any]]:
+    return get_processed_emails(limit=limit)
+
+
 @app.get("/manual-review-categories")
 def manual_review_categories() -> dict[str, list[str]]:
-    return {"categories": list(get_manual_review_categories())}
+    return {
+        "categories": list(get_manual_review_categories()),
+        "priorities": list(get_manual_review_priorities()),
+    }
 
 
 @app.post("/review-queue/{message_id}/reclassify")
 def reclassify(message_id: str, payload: ReclassifyPayload) -> dict[str, Any]:
     try:
-        return manual_reclassify_email(message_id, payload.category)
+        return manual_reclassify_email(message_id, payload.category, payload.priority_level)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@app.post("/processed-emails/{message_id}/reclassify")
+def reclassify_processed_email(message_id: str, payload: ReclassifyPayload) -> dict[str, Any]:
+    try:
+        return manual_reclassify_email(message_id, payload.category, payload.priority_level)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc

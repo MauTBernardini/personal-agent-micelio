@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 from datetime import datetime
 from typing import Any
 from urllib import error, request
@@ -17,7 +18,9 @@ import streamlit as st
 
 
 DEFAULT_API_BASE_URL = "http://127.0.0.1:8000"
-PRIORITY_CATEGORIES = {"CARREIRA_PRIORIDADE", "PROJETOS_TECH"}
+DEFAULT_API_TIMEOUT_SECONDS = 15.0
+DEFAULT_TRIAGE_TIMEOUT_SECONDS = 180.0
+PRIORITY_THEMES = {"CARREIRA", "PROJETOS_TECH", "FINANCEIRO"}
 REVIEW_CATEGORY = "EM_DUVIDA"
 
 
@@ -32,7 +35,28 @@ def get_api_base_url() -> str:
     return os.getenv("AGENT_API_BASE_URL", DEFAULT_API_BASE_URL).rstrip("/")
 
 
-def api_request(method: str, path: str, payload: dict[str, Any] | None = None) -> Any:
+def _get_timeout_from_env(env_name: str, default: float) -> float:
+    raw_value = os.getenv(env_name, str(default)).strip()
+    try:
+        return max(1.0, float(raw_value))
+    except ValueError:
+        return default
+
+
+def get_default_api_timeout_seconds() -> float:
+    return _get_timeout_from_env("AGENT_API_TIMEOUT_SECONDS", DEFAULT_API_TIMEOUT_SECONDS)
+
+
+def get_triage_timeout_seconds() -> float:
+    return _get_timeout_from_env("AGENT_TRIAGE_TIMEOUT_SECONDS", DEFAULT_TRIAGE_TIMEOUT_SECONDS)
+
+
+def api_request(
+    method: str,
+    path: str,
+    payload: dict[str, Any] | None = None,
+    timeout_seconds: float | None = None,
+) -> Any:
     """Call the FastAPI backend and return the parsed JSON response."""
 
     url = f"{get_api_base_url()}{path}"
@@ -43,8 +67,9 @@ def api_request(method: str, path: str, payload: dict[str, Any] | None = None) -
         data = json.dumps(payload).encode("utf-8")
 
     req = request.Request(url, data=data, headers=headers, method=method.upper())
+    timeout = timeout_seconds if timeout_seconds is not None else get_default_api_timeout_seconds()
     try:
-        with request.urlopen(req, timeout=30) as response:
+        with request.urlopen(req, timeout=timeout) as response:
             raw_body = response.read().decode("utf-8")
     except error.HTTPError as exc:
         raw_body = exc.read().decode("utf-8", errors="replace")
@@ -53,6 +78,12 @@ def api_request(method: str, path: str, payload: dict[str, Any] | None = None) -
         except json.JSONDecodeError:
             detail = raw_body or str(exc)
         raise RuntimeError(str(detail)) from exc
+    except (TimeoutError, socket.timeout) as exc:
+        raise RuntimeError(
+            "A API demorou mais do que o tempo limite configurado para responder. "
+            "Aumente `AGENT_TRIAGE_TIMEOUT_SECONDS` no `.env`, reduza o batch da triagem "
+            "ou verifique se o provider LLM/Gmail está lento."
+        ) from exc
     except error.URLError as exc:
         raise RuntimeError(
             "API FastAPI indisponível. Suba o backend com `uvicorn api_server:app --reload`."
@@ -185,13 +216,18 @@ def initialize_session_state() -> None:
 
     st.session_state.setdefault("last_triage_category_counts", [])
     st.session_state.setdefault("last_triage_processed", 0)
+    st.session_state.setdefault("last_triage_results", [])
     st.session_state.setdefault("triage_history", [])
 
 
 def category_style_label(category: str) -> str:
     """Return a short semantic label for category emphasis."""
 
-    if category in PRIORITY_CATEGORIES:
+    if category.startswith("ALTA_"):
+        return "Alta prioridade"
+    if category.startswith("MEDIA_"):
+        return "Média prioridade"
+    if category in PRIORITY_THEMES:
         return "Prioridade"
     if category == REVIEW_CATEGORY:
         return "Revisão"
@@ -242,9 +278,10 @@ def render_sidebar() -> dict[str, Any] | None:
     if st.sidebar.button("Rodar Triagem", use_container_width=True, type="primary"):
         try:
             with st.spinner("Executando a triagem via FastAPI..."):
-                response = api_request("POST", "/triage")
+                response = api_request("POST", "/triage", timeout_seconds=get_triage_timeout_seconds())
                 category_counts = response.get("category_counts", [])
                 processed = int(response.get("processed", 0))
+                st.session_state["last_triage_results"] = response.get("results", [])
                 st.session_state["last_triage_category_counts"] = category_counts
                 st.session_state["last_triage_processed"] = processed
                 record_triage_history(processed, category_counts)
@@ -404,6 +441,53 @@ def render_execution_history() -> None:
     st.dataframe(history_df, use_container_width=True, hide_index=True)
 
 
+def render_reclassification_controls(
+    item: dict[str, Any],
+    categories: list[str],
+    priorities: list[str],
+    endpoint_prefix: str,
+) -> None:
+    """Render manual recategorization controls for a processed email."""
+
+    message_id = str(item["message_id"])
+    current_theme = str(item.get("theme_category", "EM_DUVIDA"))
+    current_priority = str(item.get("priority_level", "MEDIA"))
+
+    select_col1, select_col2, select_col3 = st.columns([2, 1, 1])
+    theme_index = categories.index(current_theme) if current_theme in categories else 0
+    priority_index = priorities.index(current_priority) if current_priority in priorities else 1
+
+    selected_category = select_col1.selectbox(
+        "Tema manual",
+        options=categories,
+        index=theme_index,
+        key=f"{endpoint_prefix}_theme_{message_id}",
+    )
+    selected_priority = select_col2.selectbox(
+        "Prioridade manual",
+        options=priorities,
+        index=priority_index,
+        key=f"{endpoint_prefix}_priority_{message_id}",
+        disabled=selected_category == "EM_DUVIDA",
+    )
+
+    if select_col3.button("Salvar", key=f"{endpoint_prefix}_save_{message_id}", use_container_width=True, type="primary"):
+        try:
+            result = api_request(
+                "POST",
+                f"/{endpoint_prefix}/{message_id}/reclassify",
+                {"category": selected_category, "priority_level": selected_priority},
+            )
+        except RuntimeError as exc:
+            st.error(f"Falha ao reclassificar e-mail: {exc}")
+        else:
+            st.success(
+                f"E-mail {result['message_id']} atualizado para "
+                f"{result['forced_final_label']} e retroalimentado na memória semântica."
+            )
+            st.rerun()
+
+
 def render_review_queue() -> None:
     """Render emails currently waiting for manual review."""
 
@@ -421,6 +505,7 @@ def render_review_queue() -> None:
         return
 
     categories = categories_payload["categories"]
+    priorities = categories_payload["priorities"]
     if not review_queue:
         st.success("Nenhum e-mail aguardando revisão manual.")
         return
@@ -434,33 +519,97 @@ def render_review_queue() -> None:
             meta_col1.write(f"**Message ID:** {item['message_id']}")
             meta_col2.write(f"**Status atual:** {item['status']}")
             meta_col3.write(f"**Categoria atual:** {item['category']}")
+            st.caption(
+                f"Tema atual: {item.get('theme_category', 'EM_DUVIDA')} • "
+                f"Prioridade atual: {item.get('priority_level', 'BAIXA')} • "
+                f"Confiança: {item.get('confidence', 0)}"
+            )
 
             st.write("**Corpo do e-mail:**")
             st.write(item.get("body", "Sem corpo disponível."))
 
-            action_cols = st.columns(len(categories))
-            for index, category in enumerate(categories):
-                button_type = "primary" if category in PRIORITY_CATEGORIES else "secondary"
-                if action_cols[index].button(
-                    category,
-                    key=f"{item['message_id']}_{category}",
-                    use_container_width=True,
-                    type=button_type,
-                ):
-                    try:
-                        result = api_request(
-                            "POST",
-                            f"/review-queue/{item['message_id']}/reclassify",
-                            {"category": category},
-                        )
-                    except RuntimeError as exc:
-                        st.error(f"Falha ao reclassificar e-mail: {exc}")
-                    else:
-                        st.success(
-                            f"E-mail {result['message_id']} reclassificado manualmente para "
-                            f"{result['forced_category']}."
-                        )
-                        st.rerun()
+            render_reclassification_controls(item, categories, priorities, endpoint_prefix="review-queue")
+
+
+def render_last_execution_results() -> None:
+    """Show the emails and classifications produced in the latest frontend-triggered run."""
+
+    results = st.session_state.get("last_triage_results", [])
+    st.subheader("E-mails vs Classificações da Última Execução")
+    st.caption(
+        "Esta seção mostra exatamente os e-mails processados na rodada mais recente disparada por este frontend, "
+        "junto com a classificação final produzida pelo agente."
+    )
+
+    if not results:
+        st.info("Ainda não há resultados de triagem nesta sessão.")
+        return
+
+    for item in results:
+        email_data = item.get("email_data", {})
+        classification = item.get("classification_result", {})
+        header = (
+            f"{email_data.get('subject', 'Sem assunto')} • "
+            f"{classification.get('final_label', 'EM_DUVIDA')} • "
+            f"{email_data.get('sender', 'Sem remetente')}"
+        )
+        with st.expander(header, expanded=False):
+            col1, col2, col3, col4 = st.columns(4)
+            col1.write(f"**Tema:** {classification.get('theme_category', 'EM_DUVIDA')}")
+            col2.write(f"**Prioridade:** {classification.get('priority_level', 'BAIXA')}")
+            col3.write(f"**Label final:** {classification.get('final_label', 'EM_DUVIDA')}")
+            col4.write(f"**Confiança:** {classification.get('confidence', 0)}")
+            st.write("**Resumo da decisão**")
+            st.write(
+                f"Tema: {classification.get('motivo_tema', 'N/D')}  \n"
+                f"Prioridade: {classification.get('motivo_prioridade', 'N/D')}"
+            )
+            st.write("**Corpo do e-mail:**")
+            st.write(email_data.get("body", "Sem corpo disponível."))
+
+
+def render_processed_email_audit() -> None:
+    """Render a searchable audit view with manual reclassification for processed emails."""
+
+    st.subheader("Auditoria e Reclassificação Manual")
+    st.caption(
+        "Aqui você pode revisar os e-mails já processados, comparar o conteúdo com a classificação aplicada "
+        "e corrigir tema/prioridade manualmente. Cada correção atualiza o PostgreSQL e adiciona aprendizado ao Chroma."
+    )
+
+    try:
+        processed_emails = api_request("GET", "/processed-emails?limit=40")
+        categories_payload = api_request("GET", "/manual-review-categories")
+    except RuntimeError as exc:
+        st.error(f"Não foi possível carregar os e-mails processados: {exc}")
+        return
+
+    categories = categories_payload["categories"]
+    priorities = categories_payload["priorities"]
+    if not processed_emails:
+        st.info("Nenhum e-mail processado disponível para auditoria ainda.")
+        return
+
+    for item in processed_emails:
+        header = (
+            f"{item['subject']} • {item.get('final_label', item.get('category', 'EM_DUVIDA'))} • "
+            f"{item['sender']}"
+        )
+        with st.expander(header, expanded=False):
+            meta_col1, meta_col2, meta_col3, meta_col4 = st.columns(4)
+            meta_col1.write(f"**Status:** {item['status']}")
+            meta_col2.write(f"**Tema:** {item.get('theme_category', 'EM_DUVIDA')}")
+            meta_col3.write(f"**Prioridade:** {item.get('priority_level', 'BAIXA')}")
+            meta_col4.write(f"**Atualizado em:** {item.get('updated_at', '-')}")
+            st.caption(
+                f"Label final: {item.get('final_label', 'EM_DUVIDA')} • "
+                f"Ação: {item.get('needs_action', False)} • "
+                f"Importância: {item.get('is_important', False)} • "
+                f"Flag Gmail: {item.get('gmail_flagged', False)}"
+            )
+            st.write("**Corpo do e-mail:**")
+            st.write(item.get("body", "Sem corpo disponível."))
+            render_reclassification_controls(item, categories, priorities, endpoint_prefix="processed-emails")
 
 
 def main() -> None:
@@ -480,13 +629,19 @@ def main() -> None:
     render_hero(status, dashboard_payload)
     render_metrics(dashboard_payload)
 
-    overview_tab, review_tab = st.tabs(["Visão Geral", "Revisão Manual"])
+    overview_tab, execution_tab, review_tab = st.tabs(["Visão Geral", "Execuções & Correções", "Revisão Manual"])
 
     with overview_tab:
         st.divider()
         render_category_breakdowns(dashboard_payload)
         st.divider()
         render_execution_history()
+
+    with execution_tab:
+        st.divider()
+        render_last_execution_results()
+        st.divider()
+        render_processed_email_audit()
 
     with review_tab:
         st.divider()
@@ -495,4 +650,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

@@ -53,6 +53,7 @@ ENV_FILE_PATH: Final[Path] = BASE_DIR / ".env"
 ANTHROPIC_MODEL: Final[str] = "claude-3-haiku-20240307"
 OPENAI_MODEL: Final[str] = "gpt-5-mini"
 GEMINI_MODEL: Final[str] = "gemini-2.5-flash-lite"
+GEMINI_FALLBACK_MODEL: Final[str] = "gemini-2.5-flash"
 DEFAULT_DATABASE_URL: Final[str] = "postgresql://micelio:micelio@localhost:5432/email_agent"
 
 DEFAULT_LLM_PROVIDER: Final[str] = "gemini"
@@ -71,6 +72,7 @@ DEFAULT_GMAIL_TOKEN_FILE: Final[Path] = BASE_DIR / "gmail_token.json"
 DEFAULT_GMAIL_AUTH_URI: Final[str] = "https://accounts.google.com/o/oauth2/auth"
 DEFAULT_GMAIL_TOKEN_URI: Final[str] = "https://oauth2.googleapis.com/token"
 DEFAULT_API_BASE_URL: Final[str] = "http://127.0.0.1:8000"
+DEFAULT_TRIAGE_BATCH_SIZE: Final[int] = 8
 GMAIL_SCOPES: Final[tuple[str, ...]] = ("https://www.googleapis.com/auth/gmail.modify",)
 
 
@@ -115,6 +117,10 @@ def get_llm_provider() -> str:
 
 def get_gemini_model_name() -> str:
     return os.getenv("GEMINI_MODEL", GEMINI_MODEL).strip() or GEMINI_MODEL
+
+
+def get_gemini_fallback_model_name() -> str:
+    return os.getenv("GEMINI_FALLBACK_MODEL", GEMINI_FALLBACK_MODEL).strip() or GEMINI_FALLBACK_MODEL
 
 
 def get_openai_model_name() -> str:
@@ -245,5 +251,14 @@ def get_api_base_url() -> str:
     return os.getenv("AGENT_API_BASE_URL", DEFAULT_API_BASE_URL).rstrip("/")
 
 
-load_local_env_file()
+def get_triage_batch_size() -> int:
+    """Return the default number of emails processed per triage execution."""
 
+    raw_value = os.getenv("TRIAGE_BATCH_SIZE", str(DEFAULT_TRIAGE_BATCH_SIZE)).strip()
+    try:
+        return max(1, int(raw_value))
+    except ValueError:
+        return DEFAULT_TRIAGE_BATCH_SIZE
+
+
+load_local_env_file()

@@ -247,11 +247,12 @@ def gmail_get_message_stub(message_id: str) -> dict[str, Any] | None:
     return None
 
 
-def gmail_move_message_stub(message_id: str, category: str) -> dict[str, Any]:
+def gmail_move_message_stub(message_id: str, category: str, should_flag: bool = False) -> dict[str, Any]:
     return {
         "message_id": message_id,
         "destination_label": f"AUTO_{category}",
         "moved": True,
+        "flagged": should_flag,
         "marked_as_read": False,
     }
 
@@ -362,7 +363,7 @@ def _ensure_gmail_label(service: Any, label_name: str) -> str:
     return str(created_label.get("id", ""))
 
 
-def gmail_move_message_real(message_id: str, category: str) -> dict[str, Any]:
+def gmail_move_message_real(message_id: str, category: str, should_flag: bool = False) -> dict[str, Any]:
     service = _build_gmail_service()
     destination_label = f"{get_gmail_label_prefix()}{category}"
     destination_label_id = _ensure_gmail_label(service, destination_label)
@@ -370,6 +371,9 @@ def gmail_move_message_real(message_id: str, category: str) -> dict[str, Any]:
     remove_label_ids: list[str] = []
     if should_archive_after_triage():
         remove_label_ids.append("INBOX")
+    add_label_ids = [destination_label_id]
+    if should_flag:
+        add_label_ids.append("STARRED")
 
     modified_message = (
         service.users()
@@ -377,7 +381,7 @@ def gmail_move_message_real(message_id: str, category: str) -> dict[str, Any]:
         .modify(
             userId=get_gmail_user_id(),
             id=message_id,
-            body={"addLabelIds": [destination_label_id], "removeLabelIds": remove_label_ids},
+            body={"addLabelIds": add_label_ids, "removeLabelIds": remove_label_ids},
         )
         .execute()
     )
@@ -388,6 +392,7 @@ def gmail_move_message_real(message_id: str, category: str) -> dict[str, Any]:
         "destination_label": destination_label,
         "moved": True,
         "archived": should_archive_after_triage(),
+        "flagged": should_flag,
         "marked_as_read": False,
         "resulting_label_ids": resulting_labels,
     }
@@ -405,8 +410,7 @@ def get_email_message(message_id: str) -> dict[str, Any] | None:
     return gmail_get_message_stub(message_id)
 
 
-def move_email_message(message_id: str, category: str) -> dict[str, Any]:
+def move_email_message(message_id: str, category: str, should_flag: bool = False) -> dict[str, Any]:
     if get_email_provider() == "gmail":
-        return gmail_move_message_real(message_id, category)
-    return gmail_move_message_stub(message_id, category)
-
+        return gmail_move_message_real(message_id, category, should_flag=should_flag)
+    return gmail_move_message_stub(message_id, category, should_flag=should_flag)

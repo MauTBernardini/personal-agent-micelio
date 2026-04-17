@@ -1,17 +1,28 @@
 """Public package interface for the personal email triage agent."""
 
-from email_agent.email_provider import (
-    MOCK_INBOX,
-    get_email_message,
-    list_email_messages,
-    move_email_message,
+from email_agent.email_provider import MOCK_INBOX, get_email_message, list_email_messages, move_email_message
+from email_agent.llm import (
+    LLMProviderError,
+    build_factual_memory_summary,
+    classify_email_with_llm,
+    summarize_memory_email,
 )
-from email_agent.llm import LLMProviderError, classify_email_with_llm, summarize_priority_email
-from email_agent.models import ALLOWED_CATEGORIES, MANUAL_REVIEW_CATEGORIES, EmailAgentState, MockEmail
+from email_agent.models import (
+    FINAL_LABELS,
+    MANUAL_REVIEW_CATEGORIES,
+    MANUAL_REVIEW_PRIORITY_LEVELS,
+    PRIORITY_LEVELS,
+    THEME_CATEGORIES,
+    EmailAgentState,
+    FewShotExample,
+    MockEmail,
+)
 from email_agent.service import (
     build_dashboard_payload,
     get_connection_status,
     get_manual_review_categories,
+    get_manual_review_priorities,
+    get_processed_emails,
     get_review_queue,
     manual_reclassify_email,
     run_triage_and_collect,
@@ -49,7 +60,9 @@ from email_agent.storage import (
     get_chroma_collection,
     get_dashboard_metrics,
     get_postgres_connection,
+    get_recent_processed_rows,
     init_postgres_db,
+    query_semantic_examples,
     save_processed_email,
     upsert_semantic_memory,
 )
@@ -59,19 +72,25 @@ from email_agent.workflow import (
     dynamic_learning,
     execute_action,
     retrieve_context,
+    run_triage_batch,
     run_triage_workflow,
     should_run_dynamic_learning,
     summarize_category_counts,
 )
 
 __all__ = [
-    "ALLOWED_CATEGORIES",
+    "FINAL_LABELS",
     "EmailAgentState",
+    "FewShotExample",
     "LLMProviderError",
     "MANUAL_REVIEW_CATEGORIES",
+    "MANUAL_REVIEW_PRIORITY_LEVELS",
     "MOCK_INBOX",
     "MockEmail",
+    "PRIORITY_LEVELS",
+    "THEME_CATEGORIES",
     "bootstrap_services",
+    "build_factual_memory_summary",
     "build_dashboard_payload",
     "build_email_triage_graph",
     "build_gmail_triage_query",
@@ -105,15 +124,20 @@ __all__ = [
     "get_gmail_user_id",
     "get_llm_provider",
     "get_manual_review_categories",
+    "get_manual_review_priorities",
     "get_openai_model_name",
     "get_postgres_connection",
+    "get_processed_emails",
+    "get_recent_processed_rows",
     "get_review_queue",
     "init_postgres_db",
     "list_email_messages",
     "load_local_env_file",
     "manual_reclassify_email",
     "move_email_message",
+    "query_semantic_examples",
     "retrieve_context",
+    "run_triage_batch",
     "run_triage_and_collect",
     "run_triage_workflow",
     "save_processed_email",
@@ -121,7 +145,6 @@ __all__ = [
     "should_require_gmail_inbox",
     "should_run_dynamic_learning",
     "summarize_category_counts",
-    "summarize_priority_email",
+    "summarize_memory_email",
     "upsert_semantic_memory",
 ]
-
