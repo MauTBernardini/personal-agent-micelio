@@ -5,7 +5,9 @@ from __future__ import annotations
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
+from scalar_fastapi import get_scalar_api_reference
 
 from email_agent.llm import LLMProviderError
 from email_agent.service import (
@@ -27,6 +29,14 @@ app = FastAPI(
     version="0.1.0",
     description="API para triagem de e-mails, dashboard e revisão manual.",
 )
+
+
+@app.get("/scalar", include_in_schema=False, response_class=HTMLResponse)
+def scalar_docs() -> HTMLResponse:
+    return get_scalar_api_reference(
+        openapi_url=app.openapi_url,
+        title=app.title,
+    )
 
 
 @app.get("/health")
@@ -68,4 +78,5 @@ def reclassify(message_id: str, payload: ReclassifyPayload) -> dict[str, Any]:
         return manual_reclassify_email(message_id, payload.category)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
 
