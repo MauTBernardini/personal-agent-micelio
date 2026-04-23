@@ -57,9 +57,10 @@ Instruções:
 2. Analise tema e prioridade separadamente, ainda que na mesma resposta.
 3. Use os few-shots como referência, inclusive o exemplo negativo, para evitar analogias fáceis e alucinações.
 4. Baseie a decisão apenas no conteúdo do e-mail e nos few-shots fornecidos.
-5. Se houver ambiguidade real sobre o tema, escolha EM_DUVIDA.
-6. Responda APENAS com JSON válido.
-7. O JSON deve conter exatamente:
+5. Regras fortes de categorização: remetentes `noreply` ou `jobs-noreply` do domínio LinkedIn devem ser tratados como `CARREIRA` com prioridade `BAIXA`, salvo evidência explícita muito forte de urgência operacional real. Remetentes cujo nome ou endereço contenham `newsletter`, `digest`, `roundup` ou `bulletin` tendem a ser `NEWSLETTER` com prioridade `BAIXA`, salvo evidência muito forte em contrário.
+6. Se houver ambiguidade real sobre o tema, escolha EM_DUVIDA.
+7. Responda APENAS com JSON válido.
+8. O JSON deve conter exatamente:
    - "theme_category": string
    - "theme_confidence": número entre 0 e 1
    - "theme_reason": string curta em português
@@ -71,7 +72,7 @@ Instruções:
    - "time_sensitivity": BAIXA, MEDIA ou ALTA
    - "evidence": lista de 2 ou 3 evidências curtas ancoradas no e-mail
    - "uncertainty_reason": string curta ou vazia
-8. Regra de ouro: NUNCA marcar o e-mail como lido na origem.
+9. Regra de ouro: NUNCA marcar o e-mail como lido na origem.
 """.strip()
 
 SUMMARY_PROMPT: Final[str] = """

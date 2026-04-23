@@ -31,6 +31,66 @@ class LLMProviderError(RuntimeError):
     """Raised when the configured LLM provider cannot satisfy a request."""
 
 
+def _extract_sender_address(sender: str) -> str:
+    match = re.search(r"<([^>]+)>", sender)
+    if match:
+        return match.group(1).strip().lower()
+    return sender.strip().lower()
+
+
+def _sender_based_classification_override(email_data: dict[str, Any]) -> dict[str, Any] | None:
+    sender_raw = str(email_data.get("sender", "")).strip()
+    sender_address = _extract_sender_address(sender_raw)
+    sender_text = f"{sender_raw} {sender_address}".lower()
+
+    if "linkedin" in sender_text and (
+        sender_address.startswith("noreply@")
+        or sender_address.startswith("jobs-noreply@")
+        or "noreply" in sender_address
+    ):
+        return {
+            "theme_category": "CARREIRA",
+            "priority_level": "BAIXA",
+            "needs_action": False,
+            "is_important": False,
+            "time_sensitivity": "BAIXA",
+            "confidence": 0.99,
+            "motivo_tema": "Regra determinística: remetente noreply do LinkedIn tratado como carreira.",
+            "motivo_prioridade": "Regra determinística: notificações automáticas do LinkedIn entram como baixa prioridade.",
+            "evidence": [
+                sender_raw or "Remetente ausente.",
+                str(email_data.get("subject", "")).strip() or "Assunto ausente.",
+            ],
+            "uncertainty_reason": "",
+            "final_label": "BAIXA_CARREIRA",
+            "gmail_flagged": False,
+            "requires_manual_review": False,
+        }
+
+    newsletter_signals = ("newsletter", "digest", "roundup", "bulletin")
+    if any(signal in sender_text for signal in newsletter_signals):
+        return {
+            "theme_category": "NEWSLETTER",
+            "priority_level": "BAIXA",
+            "needs_action": False,
+            "is_important": False,
+            "time_sensitivity": "BAIXA",
+            "confidence": 0.97,
+            "motivo_tema": "Regra determinística: remetente com sinal forte de newsletter.",
+            "motivo_prioridade": "Regra determinística: newsletters entram como baixa prioridade.",
+            "evidence": [
+                sender_raw or "Remetente ausente.",
+                str(email_data.get("subject", "")).strip() or "Assunto ausente.",
+            ],
+            "uncertainty_reason": "",
+            "final_label": "BAIXA_NEWSLETTER",
+            "gmail_flagged": False,
+            "requires_manual_review": False,
+        }
+
+    return None
+
+
 def _is_quota_message(raw_message: str) -> bool:
     normalized_message = raw_message.lower()
     return "resource_exhausted" in normalized_message or "quota" in normalized_message or "429" in normalized_message
@@ -445,6 +505,10 @@ def classify_email_with_llm(
     theme_few_shots: list[FewShotExample],
     priority_few_shots: list[FewShotExample],
 ) -> dict[str, Any]:
+    override_result = _sender_based_classification_override(email_data)
+    if override_result is not None:
+        return override_result
+
     if get_llm_provider() == "heuristic":
         theme_result = _heuristic_theme_classifier(email_data, rag_context)
         priority_result = _heuristic_priority_classifier(email_data, theme_result)
