@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import date, datetime
 import json
 import hashlib
 import uuid
@@ -921,6 +922,16 @@ def _parse_json_column(value: Any, default: Any) -> Any:
         return default
 
 
+def _json_default(value: Any) -> Any:
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    raise TypeError(f"Object of type {value.__class__.__name__} is not JSON serializable")
+
+
+def _json_dumps(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, default=_json_default)
+
+
 def _normalize_text_for_fingerprint(text_content: str) -> str:
     return " ".join(str(text_content).split()).strip().lower()
 
@@ -1504,17 +1515,17 @@ def save_antese_execution(
                     audience,
                     tone_override,
                     source_notes,
-                    json.dumps(must_include, ensure_ascii=False),
-                    json.dumps(must_avoid, ensure_ascii=False),
+                    _json_dumps(must_include),
+                    _json_dumps(must_avoid),
                     reference_text,
-                    json.dumps(normalized_brief, ensure_ascii=False),
-                    json.dumps(applied_style_profile, ensure_ascii=False),
-                    json.dumps(applied_genre_card, ensure_ascii=False),
-                    json.dumps(retrieved_examples_preview, ensure_ascii=False),
+                    _json_dumps(normalized_brief),
+                    _json_dumps(applied_style_profile),
+                    _json_dumps(applied_genre_card),
+                    _json_dumps(retrieved_examples_preview),
                     outline_text,
                     draft_text,
                     final_text,
-                    json.dumps(quality_report, ensure_ascii=False),
+                    _json_dumps(quality_report),
                 ),
             )
         connection.commit()
@@ -1560,7 +1571,7 @@ def save_antese_version(
                     stage,
                     action_label,
                     output_text,
-                    json.dumps(metadata, ensure_ascii=False),
+                    _json_dumps(metadata),
                 ),
             )
         connection.commit()
