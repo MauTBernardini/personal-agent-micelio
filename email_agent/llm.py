@@ -478,6 +478,12 @@ def _invoke_llm_text(system_prompt: str, user_prompt: str, json_output: bool) ->
     raise LLMProviderError(f"LLM provider nao suportado: {provider}")
 
 
+def invoke_llm_text(system_prompt: str, user_prompt: str, json_output: bool = False) -> str:
+    """Public helper to reuse the configured LLM provider outside the email agent."""
+
+    return _invoke_llm_text(system_prompt, user_prompt, json_output=json_output)
+
+
 def _format_few_shots(few_shots: list[FewShotExample], focus: str) -> str:
     if not few_shots:
         return "Nenhum few-shot disponível na memória semântica ainda."

@@ -48,6 +48,9 @@ except ImportError:  # pragma: no cover
 BASE_DIR: Final[Path] = Path(__file__).resolve().parent.parent
 CHROMA_PATH: Final[Path] = BASE_DIR / "chroma_db"
 CHROMA_COLLECTION_NAME: Final[str] = "semantic_memory"
+WRITING_SAMPLES_COLLECTION_NAME: Final[str] = "writing_samples_memory"
+WRITING_FEEDBACK_COLLECTION_NAME: Final[str] = "writing_feedback_memory"
+WRITING_RUNS_COLLECTION_NAME: Final[str] = "writing_runs_memory"
 ENV_FILE_PATH: Final[Path] = BASE_DIR / ".env"
 
 ANTHROPIC_MODEL: Final[str] = "claude-3-haiku-20240307"
