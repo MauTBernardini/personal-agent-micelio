@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import uuid
 from typing import Any, cast
 
@@ -168,6 +169,7 @@ def init_postgres_db() -> None:
                     editorial_summary TEXT NOT NULL,
                     style_profile_id VARCHAR(100),
                     genre_id VARCHAR(100),
+                    text_fingerprint VARCHAR(64),
                     metadata_json TEXT NOT NULL,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -314,6 +316,14 @@ def init_postgres_db() -> None:
             cursor.execute("ALTER TABLE supervisor_executions ADD COLUMN IF NOT EXISTS email_limit INTEGER")
             cursor.execute("ALTER TABLE supervisor_executions ADD COLUMN IF NOT EXISTS output_preview TEXT")
             cursor.execute("ALTER TABLE supervisor_executions ADD COLUMN IF NOT EXISTS agent_outputs_json TEXT")
+            cursor.execute("ALTER TABLE antese_samples ADD COLUMN IF NOT EXISTS text_fingerprint VARCHAR(64)")
+            cursor.execute(
+                """
+                UPDATE antese_samples
+                SET text_fingerprint = md5(lower(regexp_replace(text_content, '\\s+', ' ', 'g')))
+                WHERE text_fingerprint IS NULL
+                """
+            )
             cursor.execute(
                 """
                 UPDATE supervisor_executions
@@ -328,6 +338,25 @@ def init_postgres_db() -> None:
             cursor.execute("ALTER TABLE supervisor_executions ALTER COLUMN reason SET NOT NULL")
             cursor.execute("ALTER TABLE supervisor_executions ALTER COLUMN execution_plan_json SET NOT NULL")
             cursor.execute("ALTER TABLE supervisor_executions ALTER COLUMN agent_outputs_json SET NOT NULL")
+            cursor.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_antese_samples_text_fingerprint
+                ON antese_samples (text_fingerprint)
+                WHERE text_fingerprint IS NOT NULL
+                """
+            )
+            cursor.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_antese_samples_updated_at
+                ON antese_samples (updated_at DESC)
+                """
+            )
+            cursor.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_antese_samples_genre_id
+                ON antese_samples (genre_id)
+                """
+            )
             cursor.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_processed_emails_status
@@ -892,6 +921,15 @@ def _parse_json_column(value: Any, default: Any) -> Any:
         return default
 
 
+def _normalize_text_for_fingerprint(text_content: str) -> str:
+    return " ".join(str(text_content).split()).strip().lower()
+
+
+def _build_text_fingerprint(text_content: str) -> str:
+    normalized = _normalize_text_for_fingerprint(text_content)
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
 def get_antese_style_profiles() -> list[dict[str, Any]]:
     """Return style profiles available to Antese."""
 
@@ -1120,16 +1158,73 @@ def save_antese_sample(
     """Persist one writing sample and index it in Chroma."""
 
     bootstrap_services()
-    sample_id = uuid.uuid4().hex
+    normalized_fingerprint = _build_text_fingerprint(text_content)
     with get_postgres_connection() as connection:
         with connection.cursor() as cursor:
             cursor.execute(
                 """
+                SELECT sample_id, style_profile_id, genre_id, metadata_json
+                FROM antese_samples
+                WHERE text_fingerprint = %s
+                LIMIT 1
+                """,
+                (normalized_fingerprint,),
+            )
+            existing_row = cursor.fetchone()
+            if existing_row:
+                existing = dict(cast(dict[str, Any], existing_row))
+                sample_id = str(existing["sample_id"])
+                existing_metadata = _parse_json_column(existing.get("metadata_json", "{}"), {})
+                merged_metadata = {**existing_metadata, **metadata}
+                cursor.execute(
+                    """
+                    UPDATE antese_samples
+                    SET
+                        title = %s,
+                        source_scope = %s,
+                        editorial_summary = %s,
+                        style_profile_id = %s,
+                        genre_id = %s,
+                        metadata_json = %s,
+                        updated_at = NOW()
+                    WHERE sample_id = %s
+                    """,
+                    (
+                        title,
+                        source_scope,
+                        editorial_summary,
+                        style_profile_id or existing.get("style_profile_id"),
+                        genre_id or existing.get("genre_id"),
+                        json.dumps(merged_metadata, ensure_ascii=False),
+                        sample_id,
+                    ),
+                )
+                connection.commit()
+                get_writing_samples_collection().upsert(
+                    ids=[sample_id],
+                    documents=[f"{title}\n\n{text_content}".strip()],
+                    metadatas=[
+                        {
+                            "sample_id": sample_id,
+                            "title": title,
+                            "source_scope": source_scope,
+                            "style_profile_id": style_profile_id or str(existing.get("style_profile_id", "")),
+                            "genre_id": genre_id or str(existing.get("genre_id", "")),
+                            "editorial_summary": editorial_summary,
+                            "text_fingerprint": normalized_fingerprint,
+                        }
+                    ],
+                )
+                return sample_id
+
+            sample_id = uuid.uuid4().hex
+            cursor.execute(
+                """
                 INSERT INTO antese_samples (
                     sample_id, title, source_scope, text_content, editorial_summary,
-                    style_profile_id, genre_id, metadata_json
+                    style_profile_id, genre_id, text_fingerprint, metadata_json
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     sample_id,
@@ -1139,6 +1234,7 @@ def save_antese_sample(
                     editorial_summary,
                     style_profile_id,
                     genre_id,
+                    normalized_fingerprint,
                     json.dumps(metadata, ensure_ascii=False),
                 ),
             )
@@ -1155,10 +1251,101 @@ def save_antese_sample(
                 "style_profile_id": style_profile_id or "",
                 "genre_id": genre_id or "",
                 "editorial_summary": editorial_summary,
+                "text_fingerprint": normalized_fingerprint,
             }
         ],
     )
     return sample_id
+
+
+def get_antese_samples(limit: int = 200) -> list[dict[str, Any]]:
+    """Return persisted writing samples for audit and manual genre correction."""
+
+    bootstrap_services()
+    with get_postgres_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    sample_id,
+                    title,
+                    source_scope,
+                    text_content,
+                    editorial_summary,
+                    style_profile_id,
+                    genre_id,
+                    text_fingerprint,
+                    metadata_json,
+                    created_at,
+                    updated_at
+                FROM antese_samples
+                ORDER BY updated_at DESC, created_at DESC
+                LIMIT %s
+                """,
+                (max(1, limit),),
+            )
+            rows = cursor.fetchall()
+
+    parsed_rows: list[dict[str, Any]] = []
+    for row in rows:
+        row_dict = dict(cast(dict[str, Any], row))
+        row_dict["metadata"] = _parse_json_column(row_dict.pop("metadata_json", "{}"), {})
+        parsed_rows.append(row_dict)
+    return parsed_rows
+
+
+def update_antese_sample_genre(sample_id: str, genre_id: str | None) -> dict[str, Any]:
+    """Update the manual genre classification of one writing sample and sync Chroma metadata."""
+
+    bootstrap_services()
+    with get_postgres_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE antese_samples
+                SET genre_id = %s, updated_at = NOW()
+                WHERE sample_id = %s
+                RETURNING
+                    sample_id,
+                    title,
+                    source_scope,
+                    text_content,
+                    editorial_summary,
+                    style_profile_id,
+                    genre_id,
+                    text_fingerprint,
+                    metadata_json,
+                    created_at,
+                    updated_at
+                """,
+                (genre_id, sample_id),
+            )
+            row = cursor.fetchone()
+        connection.commit()
+
+    if not row:
+        raise ValueError("Sample não encontrado para reclassificação.")
+
+    row_dict = dict(cast(dict[str, Any], row))
+    metadata = _parse_json_column(row_dict.pop("metadata_json", "{}"), {})
+    get_writing_samples_collection().upsert(
+        ids=[sample_id],
+        documents=[f"{row_dict['title']}\n\n{row_dict['text_content']}".strip()],
+        metadatas=[
+            {
+                "sample_id": sample_id,
+                "title": row_dict["title"],
+                "source_scope": row_dict["source_scope"],
+                "style_profile_id": row_dict.get("style_profile_id") or "",
+                "genre_id": row_dict.get("genre_id") or "",
+                "editorial_summary": row_dict["editorial_summary"],
+                "text_fingerprint": row_dict.get("text_fingerprint") or "",
+                **({"sample_type": metadata.get("sample_type", "")} if metadata else {}),
+            }
+        ],
+    )
+    row_dict["metadata"] = metadata
+    return row_dict
 
 
 def query_writing_samples(

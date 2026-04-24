@@ -16,8 +16,12 @@ from writing_agent.service import (
     get_antese_feedback,
     get_antese_genre_card_catalog,
     get_antese_inspiration_profile_catalog,
+    get_antese_samples_catalog,
     get_antese_style_profiles_catalog,
     get_antese_versions,
+    import_antese_text_samples,
+    preview_antese_sample_segmentation,
+    reclassify_antese_sample_genre,
     run_antese,
     submit_antese_feedback,
 )
@@ -104,6 +108,30 @@ class AnteseFeedbackPayload(BaseModel):
     faithfulness_score: float | None = None
     notes: str = ""
     reason_tags: list[str] = []
+
+
+class AnteseSampleImportPayload(BaseModel):
+    title: str
+    source_scope: str = "personal"
+    style_profile_id: str | None = "personal_default"
+    genre_id: str | None = None
+    source_url: str | None = None
+    raw_text: str | None = None
+    metadata: dict[str, Any] = {}
+    chunk_size: int = 1400
+    chunk_overlap: int = 200
+    segment_with_llm: bool = True
+
+
+class AnteseSampleSegmentationPreviewPayload(BaseModel):
+    title: str
+    source_url: str | None = None
+    raw_text: str | None = None
+    genre_id: str | None = None
+
+
+class AnteseSampleReclassifyPayload(BaseModel):
+    genre_id: str | None = None
 
 
 app = FastAPI(
@@ -245,6 +273,56 @@ def antese_create_genre_card(payload: GenreCardPayload) -> dict[str, Any]:
 @app.get("/antese/inspiration-profiles")
 def antese_inspiration_profiles() -> dict[str, list[dict[str, Any]]]:
     return {"inspiration_profiles": get_antese_inspiration_profile_catalog()}
+
+
+@app.post("/antese/samples/import")
+def antese_import_samples(payload: AnteseSampleImportPayload) -> dict[str, Any]:
+    try:
+        return import_antese_text_samples(
+            title=payload.title,
+            source_scope=payload.source_scope,
+            style_profile_id=payload.style_profile_id,
+            genre_id=payload.genre_id,
+            source_url=payload.source_url,
+            raw_text=payload.raw_text,
+            metadata=payload.metadata,
+            chunk_size=payload.chunk_size,
+            chunk_overlap=payload.chunk_overlap,
+            segment_with_llm=payload.segment_with_llm,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/antese/samples/preview-segmentation")
+def antese_preview_segmentation(payload: AnteseSampleSegmentationPreviewPayload) -> dict[str, Any]:
+    try:
+        return preview_antese_sample_segmentation(
+            title=payload.title,
+            source_url=payload.source_url,
+            raw_text=payload.raw_text,
+            genre_id=payload.genre_id,
+        )
+    except LLMProviderError as exc:
+        message = str(exc).lower()
+        if "cota" in message or "quota" in message or "rate limit" in message:
+            raise HTTPException(status_code=429, detail=str(exc)) from exc
+        raise HTTPException(status_code=424, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/antese/samples")
+def antese_samples(limit: int = Query(default=200, ge=1, le=1000)) -> dict[str, list[dict[str, Any]]]:
+    return {"samples": get_antese_samples_catalog(limit=limit)}
+
+
+@app.post("/antese/samples/{sample_id}/reclassify")
+def antese_reclassify_sample(sample_id: str, payload: AnteseSampleReclassifyPayload) -> dict[str, Any]:
+    try:
+        return reclassify_antese_sample_genre(sample_id=sample_id, genre_id=payload.genre_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/antese/executions")

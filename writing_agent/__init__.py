@@ -67,6 +67,12 @@ def create_or_update_antese_genre_card(*args, **kwargs):
     return _create_or_update_antese_genre_card(*args, **kwargs)
 
 
+def import_antese_text_samples(*args, **kwargs):
+    from writing_agent.service import import_antese_text_samples as _import_antese_text_samples
+
+    return _import_antese_text_samples(*args, **kwargs)
+
+
 def submit_antese_feedback(*args, **kwargs):
     from writing_agent.service import submit_antese_feedback as _submit_antese_feedback
 
@@ -80,6 +86,7 @@ __all__ = [
     "WRITING_TASK_TYPES",
     "create_or_update_antese_genre_card",
     "create_or_update_antese_style_profile",
+    "import_antese_text_samples",
     "get_antese_capabilities",
     "get_antese_execution_history",
     "get_antese_feedback",

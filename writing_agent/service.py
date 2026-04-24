@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import html
 import json
 import re
+from urllib.parse import urlparse
+from urllib import request as urlrequest
 import uuid
 from typing import Any
 
 from email_agent.llm import LLMProviderError, invoke_llm_text
 from email_agent.settings import get_llm_provider
 from email_agent.storage import (
+    get_antese_samples,
     get_antese_feedback_history,
     get_antese_execution_versions,
     get_antese_executions,
@@ -25,6 +29,7 @@ from email_agent.storage import (
     save_antese_sample,
     save_antese_style_profile,
     save_antese_version,
+    update_antese_sample_genre,
 )
 from writing_agent.models import (
     ANTese_SYSTEM_PROMPT,
@@ -61,12 +66,377 @@ def _safe_json_loads(raw_text: str) -> dict[str, Any]:
         return json.loads(match.group(0))
 
 
+def _strip_html_to_text(raw_html: str) -> str:
+    """Extract readable text from simple HTML pages without extra dependencies."""
+
+    cleaned = re.sub(r"<script\b[^>]*>.*?</script>", " ", raw_html, flags=re.IGNORECASE | re.DOTALL)
+    cleaned = re.sub(r"<style\b[^>]*>.*?</style>", " ", cleaned, flags=re.IGNORECASE | re.DOTALL)
+    cleaned = re.sub(r"<noscript\b[^>]*>.*?</noscript>", " ", cleaned, flags=re.IGNORECASE | re.DOTALL)
+    cleaned = re.sub(r"<br\s*/?>", "\n", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"</p\s*>", "\n\n", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"</div\s*>", "\n", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"<[^>]+>", " ", cleaned)
+    cleaned = html.unescape(cleaned)
+    cleaned = re.sub(r"[ \t]+", " ", cleaned)
+    cleaned = re.sub(r"\n[ \t]+", "\n", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
+def _extract_gamma_content_blocks(raw_html: str) -> list[dict[str, str]]:
+    """Extract ordered text blocks from Gamma's embedded Next.js payload."""
+
+    match = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', raw_html, re.DOTALL)
+    if not match:
+        return []
+    try:
+        payload = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return []
+
+    try:
+        root = payload["props"]["pageProps"]["doc"]["publishedSnapshot"]["content"]["default"]
+    except (KeyError, TypeError):
+        return []
+
+    blocks: list[dict[str, str]] = []
+    seen_normalized_texts: set[str] = set()
+
+    def walk(node: Any, path: str = "root") -> None:
+        if isinstance(node, dict):
+            text_value = node.get("text")
+            if isinstance(text_value, str):
+                normalized = " ".join(text_value.split()).strip()
+                if len(normalized) >= 20 and normalized not in seen_normalized_texts:
+                    seen_normalized_texts.add(normalized)
+                    blocks.append({"block_id": f"b{len(blocks)+1:03d}", "path": path, "text": normalized})
+            for key, value in node.items():
+                walk(value, f"{path}.{key}")
+        elif isinstance(node, list):
+            for index, value in enumerate(node):
+                walk(value, f"{path}[{index}]")
+
+    walk(root)
+    return blocks
+
+
+def _merge_short_blocks(blocks: list[dict[str, str]], min_length: int = 120) -> list[dict[str, str]]:
+    """Merge tiny Gamma blocks into larger editorial units before LLM segmentation."""
+
+    if not blocks:
+        return []
+
+    merged: list[dict[str, str]] = []
+    buffer_ids: list[str] = []
+    buffer_paths: list[str] = []
+    buffer_texts: list[str] = []
+
+    def flush() -> None:
+        if not buffer_texts:
+            return
+        merged.append(
+            {
+                "block_id": ",".join(buffer_ids),
+                "path": " | ".join(buffer_paths[:3]),
+                "text": "\n".join(buffer_texts).strip(),
+                "source_block_ids": list(buffer_ids),
+            }
+        )
+        buffer_ids.clear()
+        buffer_paths.clear()
+        buffer_texts.clear()
+
+    for block in blocks:
+        buffer_ids.append(block["block_id"])
+        buffer_paths.append(block["path"])
+        buffer_texts.append(block["text"])
+        if len(" ".join(buffer_texts)) >= min_length:
+            flush()
+    flush()
+    return merged
+
+
+def _fetch_webpage_text(source_url: str) -> str:
+    """Fetch one webpage and extract readable text for Antese samples."""
+
+    req = urlrequest.Request(
+        source_url,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/123.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+        },
+    )
+    try:
+        with urlrequest.urlopen(req, timeout=30) as response:
+            raw_html = response.read().decode("utf-8", errors="replace")
+    except Exception as exc:
+        raise ValueError(
+            f"Não foi possível buscar a URL informada. O site pode exigir autenticação ou bloquear scraping: {exc}"
+        ) from exc
+
+    extracted_text = _strip_html_to_text(raw_html)
+    if not extracted_text:
+        raise ValueError("A URL foi carregada, mas nenhum texto legível foi extraído.")
+    return extracted_text
+
+
+def _fetch_webpage_payload(source_url: str) -> tuple[str, str]:
+    """Fetch one webpage returning both raw HTML and a plain-text fallback."""
+
+    req = urlrequest.Request(
+        source_url,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/123.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+        },
+    )
+    try:
+        with urlrequest.urlopen(req, timeout=30) as response:
+            raw_html = response.read().decode("utf-8", errors="replace")
+    except Exception as exc:
+        raise ValueError(
+            f"Não foi possível buscar a URL informada. O site pode exigir autenticação ou bloquear scraping: {exc}"
+        ) from exc
+
+    extracted_text = _strip_html_to_text(raw_html)
+    if not extracted_text:
+        raise ValueError("A URL foi carregada, mas nenhum texto legível foi extraído.")
+    return raw_html, extracted_text
+
+
+def _chunk_text_for_samples(raw_text: str, chunk_size: int = 1400, chunk_overlap: int = 200) -> list[str]:
+    """Split long text into paragraph-aware chunks for Chroma ingestion."""
+
+    normalized_text = re.sub(r"\n{3,}", "\n\n", raw_text.strip())
+    paragraphs = [paragraph.strip() for paragraph in normalized_text.split("\n\n") if paragraph.strip()]
+    if not paragraphs:
+        return []
+
+    chunks: list[str] = []
+    current_chunk = ""
+    for paragraph in paragraphs:
+        candidate = f"{current_chunk}\n\n{paragraph}".strip() if current_chunk else paragraph
+        if len(candidate) <= chunk_size:
+            current_chunk = candidate
+            continue
+        if current_chunk:
+            chunks.append(current_chunk)
+            overlap_seed = current_chunk[-chunk_overlap:].strip() if chunk_overlap > 0 else ""
+            current_chunk = f"{overlap_seed}\n\n{paragraph}".strip() if overlap_seed else paragraph
+        else:
+            start = 0
+            step = max(1, chunk_size - chunk_overlap)
+            while start < len(paragraph):
+                end = min(len(paragraph), start + chunk_size)
+                chunks.append(paragraph[start:end].strip())
+                if end >= len(paragraph):
+                    break
+                start += step
+            current_chunk = ""
+    if current_chunk:
+        chunks.append(current_chunk)
+    return [chunk for chunk in chunks if chunk.strip()]
+
+
+def _build_editorial_summary(text_chunk: str) -> str:
+    """Build a compact editorial summary for one sample chunk."""
+
+    sentences = re.split(r"(?<=[.!?])\s+", " ".join(text_chunk.split()))
+    summary = " ".join(sentences[:2]).strip()
+    return (summary or text_chunk[:240].strip())[:320]
+
+
+def _infer_genre_id_from_text(text: str) -> str | None:
+    normalized = text.lower()
+    mapping = {
+        "poema": "poem",
+        "crônica": "chronicle",
+        "cronica": "chronicle",
+        "conto": "short_story",
+        "romance": "novel_excerpt",
+        "newsletter": "newsletter",
+        "artigo": "essay_article",
+    }
+    for token, genre_id in mapping.items():
+        if token in normalized:
+            return genre_id
+    return None
+
+
 def _coerce_score(value: Any, default: float = 0.7) -> float:
     try:
         numeric_value = float(value)
     except (TypeError, ValueError):
         return default
     return max(0.0, min(1.0, numeric_value))
+
+
+def _segment_content_blocks_heuristically(
+    title: str,
+    blocks: list[dict[str, str]],
+    default_genre_id: str | None,
+) -> list[dict[str, Any]]:
+    """Fallback segmentation when no LLM is available."""
+
+    samples: list[dict[str, Any]] = []
+    for index, block in enumerate(blocks, start=1):
+        sample_type = "writing_sample"
+        lowered = block["text"].lower()
+        if any(token in lowered for token in ("linkedin", "github", "sobre mim", "trabalho", "experiência", "experience")):
+            sample_type = "profile_context"
+        samples.append(
+            {
+                "sample_title": f"{title} — segmento {index}",
+                "sample_type": sample_type,
+                "genre_id": default_genre_id or _infer_genre_id_from_text(block["text"]),
+                "editorial_summary": _build_editorial_summary(block["text"]),
+                "persona_scope": "professional" if sample_type != "writing_sample" else "creative",
+                "block_ids": block["block_id"].split(","),
+                "tags": ["heuristic_segmentation"],
+            }
+        )
+    return samples
+
+
+def _build_segmentation_prompt(
+    title: str,
+    source_url: str | None,
+    blocks: list[dict[str, str]],
+    default_genre_id: str | None,
+) -> str:
+    """Build the segmentation prompt used to split imported content into Antese samples."""
+
+    block_lines = []
+    for block in blocks:
+        block_lines.append(
+            "\n".join(
+                [
+                    f"block_id: {block['block_id']}",
+                    f"source_block_ids: {', '.join(block.get('source_block_ids', [block['block_id']]))}",
+                    f"path: {block['path']}",
+                    f"text: {block['text']}",
+                ]
+            )
+        )
+    return f"""
+Você receberá blocos textuais extraídos de um portfólio/site pessoal.
+Sua tarefa é agrupar esses blocos em unidades editoriais úteis para a memória do Antese.
+
+Título da fonte: {title}
+URL: {source_url or "sem URL"}
+Genre sugerido: {default_genre_id or "nao especificado"}
+
+Tipos permitidos para `sample_type`:
+- writing_sample
+- profile_context
+- project_case
+- work_experience
+- link_hub
+- other
+
+Regras:
+1. Agrupe blocos que pertençam ao mesmo texto, seção autoral ou unidade temática.
+2. Se houver textos literários/autorais, classifique-os como `writing_sample`.
+3. Se houver bio, descrição pessoal, atuação profissional, links e afins, use os tipos apropriados.
+4. Se identificar gênero textual explícito, preencha `genre_id` com um dos valores:
+   poem, chronicle, short_story, novel_excerpt, essay_article, newsletter, outline, consolidated_memo, linkedin_post
+5. Não invente conteúdo nem ids de blocos.
+6. Use apenas block_ids existentes.
+7. Responda APENAS em JSON válido.
+
+Formato:
+{{
+  "samples": [
+    {{
+      "sample_title": "string curta",
+      "sample_type": "writing_sample|profile_context|project_case|work_experience|link_hub|other",
+      "genre_id": "string ou null",
+      "editorial_summary": "resumo curto",
+      "persona_scope": "creative|professional|personal|mixed",
+      "block_ids": ["b001", "b002"],
+      "tags": ["tag1", "tag2"]
+    }}
+  ]
+}}
+
+Blocos:
+{chr(10).join(block_lines)}
+""".strip()
+
+
+def _normalize_segmented_samples(
+    title: str,
+    blocks: list[dict[str, str]],
+    default_genre_id: str | None,
+    samples: list[Any],
+) -> list[dict[str, Any]]:
+    """Normalize the LLM segmentation payload to the internal Antese sample structure."""
+
+    valid_block_ids = {block["block_id"] for block in blocks}
+    block_aliases: dict[str, str] = {}
+    for block in blocks:
+        merged_block_id = block["block_id"]
+        block_aliases[merged_block_id] = merged_block_id
+        for source_block_id in block.get("source_block_ids", []):
+            normalized_source_block_id = str(source_block_id).strip()
+            if normalized_source_block_id:
+                block_aliases[normalized_source_block_id] = merged_block_id
+
+    normalized_samples: list[dict[str, Any]] = []
+    for index, sample in enumerate(samples, start=1):
+        if not isinstance(sample, dict):
+            continue
+        raw_block_ids = [str(item).strip() for item in sample.get("block_ids", []) if str(item).strip()]
+        block_ids: list[str] = []
+        for raw_block_id in raw_block_ids:
+            normalized_block_id = block_aliases.get(raw_block_id, raw_block_id)
+            if normalized_block_id in valid_block_ids and normalized_block_id not in block_ids:
+                block_ids.append(normalized_block_id)
+        if not block_ids:
+            continue
+        normalized_samples.append(
+            {
+                "sample_title": str(sample.get("sample_title", f"{title} — segmento {index}")).strip()
+                or f"{title} — segmento {index}",
+                "sample_type": str(sample.get("sample_type", "other")).strip() or "other",
+                "genre_id": str(sample.get("genre_id", default_genre_id or "")).strip() or default_genre_id,
+                "editorial_summary": str(sample.get("editorial_summary", "")).strip(),
+                "persona_scope": str(sample.get("persona_scope", "mixed")).strip() or "mixed",
+                "block_ids": block_ids,
+                "tags": _list_strings(sample.get("tags")) or ["llm_segmented"],
+            }
+        )
+    return normalized_samples
+
+
+def _segment_content_blocks_with_llm(
+    title: str,
+    source_url: str | None,
+    blocks: list[dict[str, str]],
+    default_genre_id: str | None,
+) -> list[dict[str, Any]]:
+    """Use the configured LLM to split one source into Antese-ready samples."""
+
+    if get_llm_provider() == "heuristic":
+        return _segment_content_blocks_heuristically(title, blocks, default_genre_id)
+
+    prompt = _build_segmentation_prompt(title, source_url, blocks, default_genre_id)
+    raw_output = invoke_llm_text(ANTese_SYSTEM_PROMPT, prompt, json_output=True)
+    parsed = _safe_json_loads(raw_output)
+    samples = parsed.get("samples", [])
+    if not isinstance(samples, list) or not samples:
+        return _segment_content_blocks_heuristically(title, blocks, default_genre_id)
+
+    normalized_samples = _normalize_segmented_samples(title, blocks, default_genre_id, samples)
+    return normalized_samples or _segment_content_blocks_heuristically(title, blocks, default_genre_id)
 
 
 def _list_strings(value: Any) -> list[str]:
@@ -359,6 +729,244 @@ def get_antese_inspiration_profile_catalog() -> list[dict[str, Any]]:
     """Return all inspiration profiles."""
 
     return get_antese_inspiration_profiles()
+
+
+def get_antese_samples_catalog(limit: int = 200) -> list[dict[str, Any]]:
+    """Return writing samples already stored for audit and manual reclassification."""
+
+    return get_antese_samples(limit=limit)
+
+
+def reclassify_antese_sample_genre(sample_id: str, genre_id: str | None) -> dict[str, Any]:
+    """Apply a manual genre correction to one writing sample."""
+
+    normalized_genre_id = (genre_id or "").strip() or None
+    if normalized_genre_id and normalized_genre_id not in {
+        "brainstorm_notes",
+        "outline",
+        "linkedin_post",
+        "essay_article",
+        "newsletter",
+        "rewrite_clarity",
+        "consolidated_memo",
+        "poem",
+        "chronicle",
+        "short_story",
+        "novel_excerpt",
+    }:
+        raise ValueError("Genre inválido para reclassificação do sample.")
+    return update_antese_sample_genre(sample_id=sample_id, genre_id=normalized_genre_id)
+
+
+def _build_preview_blocks_from_text(raw_text: str) -> list[dict[str, str]]:
+    """Create pseudo-blocks for segmentation preview when only raw text is available."""
+
+    chunks = _chunk_text_for_samples(raw_text=raw_text, chunk_size=700, chunk_overlap=0)
+    return [
+        {
+            "block_id": f"b{index:03d}",
+            "path": f"raw_text[{index}]",
+            "text": chunk,
+        }
+        for index, chunk in enumerate(chunks, start=1)
+        if chunk.strip()
+    ]
+
+
+def preview_antese_sample_segmentation(
+    title: str,
+    source_url: str | None = None,
+    raw_text: str | None = None,
+    genre_id: str | None = None,
+) -> dict[str, Any]:
+    """Preview the exact segmentation prompt and the LLM output without persisting anything."""
+
+    if not (source_url or raw_text):
+        raise ValueError("Informe `source_url` ou `raw_text` para testar a segmentação.")
+
+    raw_html = ""
+    source_text = raw_text.strip() if raw_text else ""
+    if source_url and not source_text:
+        raw_html, source_text = _fetch_webpage_payload(source_url)
+    if not source_text:
+        raise ValueError("Nenhum texto válido foi obtido para o preview.")
+
+    parsed_url = urlparse(source_url or "")
+    is_gamma_source = "gamma.site" in parsed_url.netloc or "gamma.app" in parsed_url.netloc
+    if is_gamma_source and raw_html:
+        blocks = _merge_short_blocks(_extract_gamma_content_blocks(raw_html))
+        source_parser = "gamma_next_data"
+    else:
+        blocks = _build_preview_blocks_from_text(source_text)
+        source_parser = "plain_text"
+
+    if not blocks:
+        raise ValueError("Nenhum bloco válido foi extraído para o preview do prompt.")
+
+    prompt_preview = _build_segmentation_prompt(title, source_url, blocks, genre_id)
+    if get_llm_provider() == "heuristic":
+        normalized_samples = _segment_content_blocks_heuristically(title, blocks, genre_id)
+        return {
+            "title": title,
+            "source_url": source_url,
+            "source_parser": source_parser,
+            "block_count": len(blocks),
+            "blocks_preview": blocks,
+            "prompt_preview": prompt_preview,
+            "used_strategy": "heuristic",
+            "raw_llm_output": None,
+            "parsed_response": {"samples": normalized_samples},
+            "normalized_samples": normalized_samples,
+        }
+
+    raw_output = invoke_llm_text(ANTese_SYSTEM_PROMPT, prompt_preview, json_output=True)
+    parsed = _safe_json_loads(raw_output)
+    samples = parsed.get("samples", []) if isinstance(parsed, dict) else []
+    normalized_samples = _normalize_segmented_samples(title, blocks, genre_id, samples if isinstance(samples, list) else [])
+    if not normalized_samples:
+        normalized_samples = _segment_content_blocks_heuristically(title, blocks, genre_id)
+
+    return {
+        "title": title,
+        "source_url": source_url,
+        "source_parser": source_parser,
+        "block_count": len(blocks),
+        "blocks_preview": blocks,
+        "prompt_preview": prompt_preview,
+        "used_strategy": "llm_segmentation",
+        "raw_llm_output": raw_output,
+        "parsed_response": parsed,
+        "normalized_samples": normalized_samples,
+    }
+
+
+def import_antese_text_samples(
+    title: str,
+    source_scope: str,
+    style_profile_id: str | None = "personal_default",
+    genre_id: str | None = None,
+    source_url: str | None = None,
+    raw_text: str | None = None,
+    metadata: dict[str, Any] | None = None,
+    chunk_size: int = 1400,
+    chunk_overlap: int = 200,
+    segment_with_llm: bool = True,
+) -> dict[str, Any]:
+    """Import one personal corpus into Antese samples and Chroma memory."""
+
+    if not (raw_text or source_url):
+        raise ValueError("Informe `raw_text` ou `source_url` para importar text samples.")
+
+    raw_html = ""
+    source_text = raw_text.strip() if raw_text else ""
+    if source_url and not source_text:
+        raw_html, source_text = _fetch_webpage_payload(source_url)
+    if not source_text:
+        raise ValueError("Nenhum texto válido foi obtido para importação.")
+
+    import_id = uuid.uuid4().hex[:12]
+    normalized_metadata = dict(metadata or {})
+    normalized_metadata.update(
+        {
+            "import_id": import_id,
+            "source_url": source_url or "",
+            "style_profile_id": style_profile_id or "",
+            "genre_id": genre_id or "",
+        }
+    )
+
+    sample_ids: list[str] = []
+    segmented_units: list[dict[str, Any]] = []
+
+    parsed_url = urlparse(source_url or "")
+    is_gamma_source = "gamma.site" in parsed_url.netloc or "gamma.app" in parsed_url.netloc
+    if is_gamma_source and raw_html:
+        gamma_blocks = _merge_short_blocks(_extract_gamma_content_blocks(raw_html))
+        if gamma_blocks:
+            sample_groups = (
+                _segment_content_blocks_with_llm(title, source_url, gamma_blocks, genre_id)
+                if segment_with_llm
+                else _segment_content_blocks_heuristically(title, gamma_blocks, genre_id)
+            )
+            block_map = {block["block_id"]: block for block in gamma_blocks}
+            for index, sample_group in enumerate(sample_groups, start=1):
+                texts = [block_map[block_id]["text"] for block_id in sample_group["block_ids"] if block_id in block_map]
+                combined_text = "\n\n".join(texts).strip()
+                if not combined_text:
+                    continue
+                effective_genre_id = sample_group.get("genre_id") or genre_id or _infer_genre_id_from_text(combined_text)
+                sample_id = save_antese_sample(
+                    title=str(sample_group.get("sample_title", f"{title} — segmento {index}")),
+                    source_scope=source_scope,
+                    text_content=combined_text,
+                    editorial_summary=str(sample_group.get("editorial_summary") or _build_editorial_summary(combined_text)),
+                    style_profile_id=style_profile_id if sample_group.get("sample_type") == "writing_sample" else None,
+                    genre_id=effective_genre_id,
+                    metadata={
+                        **normalized_metadata,
+                        "sample_type": sample_group.get("sample_type", "other"),
+                        "persona_scope": sample_group.get("persona_scope", "mixed"),
+                        "tags": sample_group.get("tags", []),
+                        "source_parser": "gamma_next_data",
+                        "block_ids": sample_group.get("block_ids", []),
+                    },
+                )
+                sample_ids.append(sample_id)
+                segmented_units.append(
+                    {
+                        "sample_id": sample_id,
+                        "title": str(sample_group.get("sample_title", f"{title} — segmento {index}")),
+                        "sample_type": sample_group.get("sample_type", "other"),
+                        "genre_id": effective_genre_id,
+                        "persona_scope": sample_group.get("persona_scope", "mixed"),
+                        "block_ids": sample_group.get("block_ids", []),
+                    }
+                )
+
+    if not sample_ids:
+        chunks = _chunk_text_for_samples(
+            raw_text=source_text,
+            chunk_size=max(400, chunk_size),
+            chunk_overlap=max(0, min(chunk_overlap, max(400, chunk_size) - 50)),
+        )
+        if not chunks:
+            raise ValueError("O corpus fornecido não gerou chunks válidos para indexação.")
+
+        for index, chunk in enumerate(chunks, start=1):
+            sample_id = save_antese_sample(
+                title=f"{title} — trecho {index}",
+                source_scope=source_scope,
+                text_content=chunk,
+                editorial_summary=_build_editorial_summary(chunk),
+                style_profile_id=style_profile_id,
+                genre_id=genre_id,
+                metadata={**normalized_metadata, "chunk_index": index, "chunk_count": len(chunks), "source_parser": "plain_text"},
+            )
+            sample_ids.append(sample_id)
+            segmented_units.append(
+                {
+                    "sample_id": sample_id,
+                    "title": f"{title} — trecho {index}",
+                    "sample_type": "writing_sample",
+                    "genre_id": genre_id,
+                    "persona_scope": "mixed",
+                    "block_ids": [],
+                }
+            )
+
+    return {
+        "import_id": import_id,
+        "title": title,
+        "source_scope": source_scope,
+        "style_profile_id": style_profile_id,
+        "genre_id": genre_id,
+        "source_url": source_url,
+        "chunk_count": len(sample_ids),
+        "sample_ids": sample_ids,
+        "text_length": len(source_text),
+        "segmented_units": segmented_units,
+        "source_parser": "gamma_next_data" if segmented_units and is_gamma_source else "plain_text",
+    }
 
 
 def _resolve_style_profile(style_profile_id: str | None) -> dict[str, Any]:

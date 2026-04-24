@@ -114,6 +114,38 @@ DEFAULT_ANTESE_GENRE_CARDS = [
         "tone_defaults": ["objetivo", "profissional"],
         "quality_checklist": ["Consolidacao fiel", "Proximos passos claros"],
     },
+    {
+        "genre_id": "poem",
+        "name": "Poema",
+        "primary_goal": "REFLETIR",
+        "expected_structure": ["imagem inicial", "movimento", "virada", "fecho ressonante"],
+        "tone_defaults": ["lirico", "sensorial", "condensado"],
+        "quality_checklist": ["Imagens fortes", "Economia verbal", "Ritmo perceptivel"],
+    },
+    {
+        "genre_id": "chronicle",
+        "name": "Crônica",
+        "primary_goal": "REFLETIR",
+        "expected_structure": ["cena cotidiana", "observacao", "deslocamento", "fecho reflexivo"],
+        "tone_defaults": ["intimo", "observacional", "fluido"],
+        "quality_checklist": ["Cena concreta", "Voz autoral", "Virada reflexiva"],
+    },
+    {
+        "genre_id": "short_story",
+        "name": "Conto",
+        "primary_goal": "EXPLORAR",
+        "expected_structure": ["situacao inicial", "tensao", "virada", "desfecho"],
+        "tone_defaults": ["narrativo", "concentrado", "imagetico"],
+        "quality_checklist": ["Conflito claro", "Atmosfera consistente", "Final com impacto"],
+    },
+    {
+        "genre_id": "novel_excerpt",
+        "name": "Romance (trecho)",
+        "primary_goal": "EXPLORAR",
+        "expected_structure": ["imersao", "desenvolvimento de cena", "subtexto", "gancho"],
+        "tone_defaults": ["narrativo", "expandido", "atmosferico"],
+        "quality_checklist": ["Cena sustentada", "Subtexto", "Gancho para continuidade"],
+    },
 ]
 DEFAULT_ANTESE_INSPIRATION_PROFILES = [
     {
@@ -343,6 +375,8 @@ def initialize_session_state() -> None:
     st.session_state.setdefault("last_micelio_response", None)
     st.session_state.setdefault("last_antese_response", None)
     st.session_state.setdefault("last_antese_payload", None)
+    st.session_state.setdefault("last_antese_segmentation_preview", None)
+    st.session_state.setdefault("selected_antese_sample_id", None)
     st.session_state.setdefault("triage_history", [])
 
 
@@ -949,6 +983,21 @@ def _run_antese_from_payload(payload: dict[str, Any], spinner_text: str) -> None
         st.error(f"Falha ao executar o Antese: {exc}")
 
 
+def _run_antese_segmentation_preview(payload: dict[str, Any]) -> None:
+    """Call the backend preview endpoint for Antese sample segmentation."""
+
+    try:
+        with st.spinner("Antese está montando o prompt de segmentação e chamando o modelo..."):
+            st.session_state["last_antese_segmentation_preview"] = api_request(
+                "POST",
+                "/antese/samples/preview-segmentation",
+                payload,
+                timeout_seconds=get_triage_timeout_seconds(),
+            )
+    except RuntimeError as exc:
+        st.error(f"Falha ao testar a segmentação: {exc}")
+
+
 def render_antese_workspace() -> None:
     """Render the personalized writing workspace for Antese."""
 
@@ -987,7 +1036,9 @@ def render_antese_workspace() -> None:
     default_style_profile = next(iter(style_profile_options.keys()), "personal_default")
     default_genre_card = next(iter(genre_card_options.keys()), "brainstorm_notes")
 
-    brief_tab, style_tab, draft_tab, history_tab = st.tabs(["Brief", "Style", "Draft", "History"])
+    brief_tab, style_tab, segmentation_tab, draft_tab, samples_tab, history_tab = st.tabs(
+        ["Brief", "Style", "Segmentation Test", "Draft", "Samples", "History"]
+    )
 
     with brief_tab:
         user_request = st.text_area(
@@ -1150,6 +1201,143 @@ def render_antese_workspace() -> None:
                         st.success(f"Style profile salvo: {created_profile['name']}")
                         st.rerun()
 
+        with st.expander("Importar text samples para memória de escrita", expanded=False):
+            if using_fallback_catalog:
+                st.caption("Desabilitado enquanto o backend estiver sem os endpoints novos do Antese.")
+            else:
+                with st.form("antese_import_samples_form"):
+                    import_title = st.text_input("Título do corpus", value="Mau's Domain")
+                    import_source_scope = st.selectbox("Escopo do corpus", options=["personal", "workspace", "reference"], index=0)
+                    import_style_profile_id = st.selectbox(
+                        "Associar ao style profile",
+                        options=list(style_profile_options.keys()),
+                        format_func=lambda item: style_profile_options[item]["name"],
+                        index=list(style_profile_options.keys()).index(st.session_state.get("antese_style_profile_id", default_style_profile))
+                        if st.session_state.get("antese_style_profile_id", default_style_profile) in style_profile_options
+                        else 0,
+                    )
+                    import_genre_card_id = st.selectbox(
+                        "Genre card associado (opcional)",
+                        options=[""] + list(genre_card_options.keys()),
+                        format_func=lambda item: "Sem gênero fixo" if not item else genre_card_options[item]["name"],
+                    )
+                    import_source_url = st.text_input(
+                        "URL da fonte",
+                        value="https://portfolio-digital-dl2ipti.gamma.site/",
+                    )
+                    import_raw_text = st.text_area(
+                        "Texto bruto (use este campo se o site bloquear scraping)",
+                        placeholder="Cole aqui o conteúdo exportado/copied do seu Gamma para garantir a ingestão.",
+                        height=220,
+                    )
+                    import_metadata_json = st.text_area(
+                        "Metadata extra (JSON)",
+                        value='{"source_label": "gamma_maus_domain", "owner": "mau"}',
+                        height=100,
+                    )
+                    import_segment_with_llm = st.checkbox(
+                        "Segmentar conteúdo com LLM antes de salvar",
+                        value=True,
+                        help="Para sites como Gamma, o backend tenta separar automaticamente textos autorais, bio, trabalho e outros blocos.",
+                    )
+                    import_submit = st.form_submit_button("Importar corpus", type="primary", use_container_width=True)
+
+                if import_submit:
+                    try:
+                        import_result = api_request(
+                            "POST",
+                            "/antese/samples/import",
+                            {
+                                "title": import_title,
+                                "source_scope": import_source_scope,
+                                "style_profile_id": import_style_profile_id,
+                                "genre_id": import_genre_card_id or None,
+                                "source_url": import_source_url.strip() or None,
+                                "raw_text": import_raw_text.strip() or None,
+                                "metadata": parse_json_text(import_metadata_json, {}),
+                                "segment_with_llm": import_segment_with_llm,
+                            },
+                            timeout_seconds=get_triage_timeout_seconds(),
+                        )
+                    except RuntimeError as exc:
+                        st.error(f"Falha ao importar text samples: {exc}")
+                    else:
+                        st.success(
+                            f"Corpus importado com sucesso. "
+                            f"{import_result['chunk_count']} chunk(s) indexado(s) para o Antese."
+                        )
+                        st.json(import_result)
+
+    with segmentation_tab:
+        st.markdown("**Teste do prompt de segmentação**")
+        st.caption(
+            "Este fluxo não salva nada. Ele só extrai os blocos, monta o prompt atual do segmentador "
+            "e devolve a resposta do modelo para você validar a separação."
+        )
+
+        with st.form("antese_segmentation_preview_form"):
+            preview_title = st.text_input("Título da fonte", value="Mau's Portfolio")
+            preview_url = st.text_input(
+                "URL da fonte",
+                value="https://portfolio-digital-dl2ipti.gamma.site/",
+            )
+            preview_genre_id = st.selectbox(
+                "Genre sugerido (opcional)",
+                options=[""] + list(genre_card_options.keys()),
+                format_func=lambda item: "Sem gênero fixo" if not item else genre_card_options[item]["name"],
+            )
+            preview_raw_text = st.text_area(
+                "Texto bruto opcional",
+                placeholder="Use este campo para testar a segmentação colando texto diretamente, sem buscar a URL.",
+                height=180,
+            )
+            preview_submit = st.form_submit_button(
+                "Executar teste do prompt",
+                type="primary",
+                use_container_width=True,
+            )
+
+        if preview_submit:
+            if not preview_url.strip() and not preview_raw_text.strip():
+                st.warning("Informe uma URL ou cole texto bruto para testar a segmentação.")
+            else:
+                _run_antese_segmentation_preview(
+                    {
+                        "title": preview_title.strip() or "Fonte sem título",
+                        "source_url": preview_url.strip() or None,
+                        "raw_text": preview_raw_text.strip() or None,
+                        "genre_id": preview_genre_id or None,
+                    }
+                )
+
+        preview_response = st.session_state.get("last_antese_segmentation_preview")
+        if not preview_response:
+            st.info("Nenhum teste de segmentação executado nesta sessão ainda.")
+        else:
+            meta_col1, meta_col2, meta_col3 = st.columns(3)
+            meta_col1.metric("Parser", preview_response.get("source_parser", "-"))
+            meta_col2.metric("Blocos", preview_response.get("block_count", 0))
+            meta_col3.metric("Estratégia", preview_response.get("used_strategy", "-"))
+
+            st.markdown("**Saída normalizada do segmentador**")
+            st.json(preview_response.get("normalized_samples", []))
+
+            st.markdown("**Resposta bruta do modelo**")
+            raw_output = preview_response.get("raw_llm_output")
+            if raw_output:
+                st.code(raw_output, language="json")
+            else:
+                st.caption("Sem saída bruta de LLM. O backend caiu em estratégia heurística.")
+
+            with st.expander("Prompt montado", expanded=False):
+                st.code(preview_response.get("prompt_preview", ""), language="text")
+
+            with st.expander("Blocos extraídos enviados ao prompt", expanded=False):
+                st.json(preview_response.get("blocks_preview", []))
+
+            with st.expander("Resposta parseada", expanded=False):
+                st.json(preview_response.get("parsed_response", {}))
+
     payload = {
         "user_request": user_request,
         "task_type": task_type,
@@ -1227,6 +1415,124 @@ def render_antese_workspace() -> None:
                 use_container_width=True,
                 hide_index=True,
             )
+
+    with samples_tab:
+        st.markdown("**Text samples indexados**")
+        st.caption(
+            "Aqui você consegue auditar os textos já salvos na memória de escrita e corrigir manualmente o gênero."
+        )
+        sample_limit = st.slider("Quantidade de samples", min_value=20, max_value=500, value=120, step=20)
+        try:
+            samples_payload = api_request("GET", f"/antese/samples?limit={sample_limit}")
+        except RuntimeError as exc:
+            st.error(f"Não foi possível carregar os text samples: {exc}")
+        else:
+            samples = samples_payload.get("samples", [])
+            if not samples:
+                st.info("Nenhum text sample salvo ainda.")
+            else:
+                sample_rows = [
+                    {
+                        "sample_id": item.get("sample_id", ""),
+                        "title": item.get("title", ""),
+                        "source_scope": item.get("source_scope", ""),
+                        "genre_id": item.get("genre_id", ""),
+                        "sample_type": item.get("metadata", {}).get("sample_type", ""),
+                        "persona_scope": item.get("metadata", {}).get("persona_scope", ""),
+                        "updated_at": item.get("updated_at", ""),
+                    }
+                    for item in samples
+                ]
+                sample_table = pd.DataFrame(sample_rows)
+                selection_event = st.dataframe(
+                    sample_table,
+                    use_container_width=True,
+                    hide_index=True,
+                    on_select="rerun",
+                    selection_mode="single-row",
+                )
+                if selection_event and getattr(selection_event, "selection", None):
+                    selected_rows = selection_event.selection.get("rows", [])
+                    if selected_rows:
+                        selected_index = selected_rows[0]
+                        if 0 <= selected_index < len(sample_rows):
+                            st.session_state["selected_antese_sample_id"] = sample_rows[selected_index]["sample_id"]
+
+                sample_options = [item.get("sample_id", "") for item in samples]
+                selected_sample_state = st.session_state.get("selected_antese_sample_id")
+                if selected_sample_state not in sample_options and sample_options:
+                    selected_sample_state = sample_options[0]
+                    st.session_state["selected_antese_sample_id"] = selected_sample_state
+
+                selected_sample_id = st.selectbox(
+                    "Escolha um sample para inspecionar",
+                    options=sample_options,
+                    format_func=lambda sample_id: next(
+                        (
+                            (
+                                f"{row.get('title', '')} • "
+                                f"{row.get('genre_id', '') or 'sem gênero'} • "
+                                f"{row.get('metadata', {}).get('sample_type', 'tipo n/d')} • "
+                                f"{row.get('source_scope', 'escopo n/d')}"
+                            )
+                            for row in samples
+                            if row.get("sample_id") == sample_id
+                        ),
+                        sample_id,
+                    ),
+                    key="selected_antese_sample_id",
+                )
+                selected_sample = next(
+                    (item for item in samples if item.get("sample_id") == selected_sample_id),
+                    {},
+                )
+
+                top_col1, top_col2 = st.columns([2, 1])
+                with top_col1:
+                    st.markdown("**Conteúdo do sample**")
+                    st.write(selected_sample.get("text_content", ""))
+                with top_col2:
+                    st.markdown("**Metadata**")
+                    st.json(
+                        {
+                            "title": selected_sample.get("title", ""),
+                            "genre_id": selected_sample.get("genre_id", ""),
+                            "source_scope": selected_sample.get("source_scope", ""),
+                            "style_profile_id": selected_sample.get("style_profile_id", ""),
+                            "sample_type": selected_sample.get("metadata", {}).get("sample_type", ""),
+                            "persona_scope": selected_sample.get("metadata", {}).get("persona_scope", ""),
+                            "tags": selected_sample.get("metadata", {}).get("tags", []),
+                            "text_fingerprint": selected_sample.get("text_fingerprint", ""),
+                        }
+                    )
+
+                with st.form("antese_sample_reclassify_form"):
+                    new_genre_id = st.selectbox(
+                        "Reclassificar gênero",
+                        options=[""] + list(genre_card_options.keys()),
+                        format_func=lambda item: "Sem gênero" if not item else genre_card_options[item]["name"],
+                        index=([""] + list(genre_card_options.keys())).index(selected_sample.get("genre_id", ""))
+                        if selected_sample.get("genre_id", "") in ([""] + list(genre_card_options.keys()))
+                        else 0,
+                    )
+                    reclassify_submit = st.form_submit_button(
+                        "Salvar reclassificação",
+                        type="primary",
+                        use_container_width=True,
+                    )
+
+                if reclassify_submit:
+                    try:
+                        api_request(
+                            "POST",
+                            f"/antese/samples/{selected_sample_id}/reclassify",
+                            {"genre_id": new_genre_id or None},
+                        )
+                    except RuntimeError as exc:
+                        st.error(f"Falha ao reclassificar o sample: {exc}")
+                    else:
+                        st.success("Gênero do sample atualizado com sucesso.")
+                        st.rerun()
 
     with history_tab:
         st.markdown("**Execuções recentes do Antese**")

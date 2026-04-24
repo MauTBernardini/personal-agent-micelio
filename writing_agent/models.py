@@ -39,6 +39,10 @@ GENRE_CARD_IDS: Final[tuple[str, ...]] = (
     "newsletter",
     "rewrite_clarity",
     "consolidated_memo",
+    "poem",
+    "chronicle",
+    "short_story",
+    "novel_excerpt",
 )
 
 DEFAULT_STYLE_PROFILE_IDS: Final[tuple[str, ...]] = (
@@ -318,6 +322,70 @@ DEFAULT_GENRE_CARDS: Final[list[dict[str, Any]]] = [
         "typical_openings": ["Resumo consolidado", "Sintese do material-base"],
         "typical_closings": ["Encaminhamentos", "Proximos passos"],
     },
+    {
+        "genre_id": "poem",
+        "name": "Poema",
+        "primary_goal": "REFLETIR",
+        "expected_structure": ["imagem inicial", "movimento", "virada", "fecho ressonante"],
+        "tone_defaults": ["lirico", "sensorial", "condensado"],
+        "length_defaults": {"target": "curto a medio", "stanzas": "3-8"},
+        "quality_checklist": [
+            "Imagens fortes",
+            "Economia verbal",
+            "Ritmo perceptivel",
+            "Fecho memoravel",
+        ],
+        "typical_openings": ["Uma imagem concreta", "Um gesto minimo", "Uma tensao sensorial"],
+        "typical_closings": ["Imagem final reverberante", "Fecho aberto e sugestivo"],
+    },
+    {
+        "genre_id": "chronicle",
+        "name": "Crônica",
+        "primary_goal": "REFLETIR",
+        "expected_structure": ["cena cotidiana", "observacao", "deslocamento", "fecho reflexivo"],
+        "tone_defaults": ["intimo", "observacional", "fluido"],
+        "length_defaults": {"target": "curto a medio", "paragraphs": "4-9"},
+        "quality_checklist": [
+            "Cena concreta",
+            "Voz autoral presente",
+            "Virada reflexiva natural",
+            "Leveza sem superficialidade",
+        ],
+        "typical_openings": ["Uma cena banal", "Um detalhe do cotidiano", "Uma pequena estranheza"],
+        "typical_closings": ["Reflexao curta", "Imagem que reinterpreta a cena"],
+    },
+    {
+        "genre_id": "short_story",
+        "name": "Conto",
+        "primary_goal": "EXPLORAR",
+        "expected_structure": ["situacao inicial", "tensao", "virada", "desfecho"],
+        "tone_defaults": ["narrativo", "concentrado", "imagetico"],
+        "length_defaults": {"target": "medio", "paragraphs": "6-16"},
+        "quality_checklist": [
+            "Conflito claro",
+            "Economia narrativa",
+            "Atmosfera consistente",
+            "Final com impacto",
+        ],
+        "typical_openings": ["Uma situação já em movimento", "Um gesto estranho", "Uma frase que insinua conflito"],
+        "typical_closings": ["Desfecho preciso", "Imagem final com implicacao narrativa"],
+    },
+    {
+        "genre_id": "novel_excerpt",
+        "name": "Romance (trecho)",
+        "primary_goal": "EXPLORAR",
+        "expected_structure": ["imersao", "desenvolvimento de cena", "subtexto", "gancho"],
+        "tone_defaults": ["narrativo", "expandido", "atmosferico"],
+        "length_defaults": {"target": "medio a longo", "paragraphs": "8-20"},
+        "quality_checklist": [
+            "Cena sustentada",
+            "Voz narrativa consistente",
+            "Subtexto perceptivel",
+            "Gancho para continuidade",
+        ],
+        "typical_openings": ["Entrada em cena", "Atmosfera forte", "Movimento interno ou externo"],
+        "typical_closings": ["Gancho narrativo", "Suspensao controlada", "Pergunta dramatica implicita"],
+    },
 ]
 
 DEFAULT_INSPIRATION_PROFILES: Final[list[dict[str, Any]]] = [
@@ -486,4 +554,3 @@ Regras:
 - não copie os exemplos recuperados;
 - entregue apenas o texto final.
 """.strip()
-
