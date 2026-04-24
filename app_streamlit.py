@@ -177,6 +177,34 @@ DEFAULT_ANTESE_INSPIRATION_PROFILES = [
         "transformation_strength": "media",
     },
 ]
+LITERARY_DAILY_SUGGESTIONS = [
+    "silêncio",
+    "contradição",
+    "noite",
+    "janela",
+    "cidade",
+    "gato",
+    "cansaço",
+    "deslocamento",
+    "memória",
+    "máquina",
+    "água",
+    "corredor",
+]
+DATA_ARTICLE_SUGGESTIONS = [
+    "agentes",
+    "RAG",
+    "LLMs",
+    "qualidade de dados",
+    "analytics",
+    "ciência de dados",
+    "MLOps",
+    "produto de dados",
+    "observabilidade",
+    "automação",
+    "IA aplicada",
+    "embeddings",
+]
 
 
 st.set_page_config(
@@ -377,6 +405,7 @@ def initialize_session_state() -> None:
     st.session_state.setdefault("last_antese_payload", None)
     st.session_state.setdefault("last_antese_segmentation_preview", None)
     st.session_state.setdefault("selected_antese_sample_id", None)
+    st.session_state.setdefault("last_antese_daily_response", None)
     st.session_state.setdefault("triage_history", [])
 
 
@@ -998,6 +1027,108 @@ def _run_antese_segmentation_preview(payload: dict[str, Any]) -> None:
         st.error(f"Falha ao testar a segmentação: {exc}")
 
 
+def _append_daily_suggestion(state_key: str, term: str) -> None:
+    current_value = st.session_state.get(state_key, "").strip()
+    existing_terms = [item.strip() for item in current_value.split(",") if item.strip()]
+    if term not in existing_terms:
+        existing_terms.append(term)
+    st.session_state[state_key] = ", ".join(existing_terms)
+
+
+def _build_literary_daily_payload(
+    default_style_profile: str,
+    genre_id: str,
+    inspiration_profile_id: str | None,
+    seeds_text: str,
+    sensory_text: str,
+    opening_line: str,
+    mood: str,
+    length_pref: str,
+    form_pref: str,
+) -> dict[str, Any]:
+    source_notes_parts = [
+        f"Disparadores: {seeds_text.strip()}",
+        f"Sensações e imagens: {sensory_text.strip()}",
+        f"Clima: {mood}",
+        f"Tamanho desejado: {length_pref}",
+        f"Forma desejada: {form_pref}",
+    ]
+    if opening_line.strip():
+        source_notes_parts.append(f"Frase inicial opcional: {opening_line.strip()}")
+
+    user_request = (
+        f"Escreva um {genre_id} curto e autoral a partir destes disparadores, "
+        f"preservando voz pessoal, imagética forte e concisão."
+    )
+    tone_map = {
+        "intimo": "íntimo e sensorial",
+        "melancolico": "melancólico e contido",
+        "noturno": "noturno e imagético",
+        "estranho": "estranho e ligeiramente deslocado",
+        "terno": "terno e delicado",
+        "seco": "seco e preciso",
+    }
+    return {
+        "user_request": user_request,
+        "task_type": "DRAFT",
+        "source_notes": "\n".join(part for part in source_notes_parts if part.split(": ", 1)[-1]),
+        "context_notes": "\n".join(part for part in source_notes_parts if part.split(": ", 1)[-1]),
+        "goal": "REFLETIR" if genre_id in {"poem", "chronicle"} else "EXPLORAR",
+        "genre_id": genre_id,
+        "style_profile_id": default_style_profile,
+        "inspiration_profile_id": inspiration_profile_id or None,
+        "audience": "leitores sensíveis à escrita literária",
+        "tone_override": tone_map.get(mood, "autoral, íntimo e imagético"),
+        "tone": tone_map.get(mood, "autoral, íntimo e imagético"),
+        "must_include": parse_multiline_items(opening_line) if opening_line.strip() else [],
+        "must_avoid": ["clichês", "moral explícita", "linguagem genérica"],
+        "reference_text": "",
+        "action_label": "daily_literary",
+    }
+
+
+def _build_data_article_payload(
+    workspace_style_profile: str,
+    inspiration_profile_id: str | None,
+    topic: str,
+    thesis: str,
+    angle: str,
+    audience: str,
+    article_format: str,
+    tone: str,
+    concepts_text: str,
+    notes_text: str,
+) -> dict[str, Any]:
+    user_request = (
+        f"Escreva um {article_format.lower()} para Medium sobre {topic.strip()}, "
+        f"com foco em {angle.strip() or 'um ângulo claro e original'}."
+    )
+    source_notes_parts = [
+        f"Tese ou pergunta central: {thesis.strip()}",
+        f"Ângulo: {angle.strip()}",
+        f"Conceitos obrigatórios: {concepts_text.strip()}",
+        f"Notas de apoio: {notes_text.strip()}",
+    ]
+    must_include = [item for item in parse_multiline_items(concepts_text) if item]
+    return {
+        "user_request": user_request,
+        "task_type": "DRAFT",
+        "source_notes": "\n".join(part for part in source_notes_parts if part.split(": ", 1)[-1]),
+        "context_notes": "\n".join(part for part in source_notes_parts if part.split(": ", 1)[-1]),
+        "goal": "INFORMAR" if article_format != "Artigo opinativo" else "PERSUADIR",
+        "genre_id": "essay_article",
+        "style_profile_id": workspace_style_profile,
+        "inspiration_profile_id": inspiration_profile_id or None,
+        "audience": audience,
+        "tone_override": tone,
+        "tone": tone,
+        "must_include": must_include,
+        "must_avoid": ["jargão vazio", "generalidades", "afirmações sem contexto"],
+        "reference_text": "",
+        "action_label": "daily_data_article",
+    }
+
+
 def render_antese_workspace() -> None:
     """Render the personalized writing workspace for Antese."""
 
@@ -1036,9 +1167,187 @@ def render_antese_workspace() -> None:
     default_style_profile = next(iter(style_profile_options.keys()), "personal_default")
     default_genre_card = next(iter(genre_card_options.keys()), "brainstorm_notes")
 
-    brief_tab, style_tab, segmentation_tab, draft_tab, samples_tab, history_tab = st.tabs(
-        ["Brief", "Style", "Segmentation Test", "Draft", "Samples", "History"]
+    daily_tab, brief_tab, style_tab, segmentation_tab, draft_tab, samples_tab, history_tab = st.tabs(
+        ["Diário", "Brief", "Style", "Segmentation Test", "Draft", "Samples", "History"]
     )
+
+    with daily_tab:
+        st.markdown("**Antese Diário**")
+        st.caption(
+            "Modo rápido para uso cotidiano: uma faísca literária a partir de palavras e sensações, "
+            "ou um artigo enxuto sobre Data/IA para Medium."
+        )
+        daily_mode = st.radio(
+            "Modo diário",
+            options=["Faísca Literária", "Artigo Data/IA"],
+            horizontal=True,
+            key="antese_daily_mode",
+        )
+
+        if daily_mode == "Faísca Literária":
+            lit_col1, lit_col2, lit_col3 = st.columns(3)
+            lit_genre_id = lit_col1.selectbox(
+                "Gênero",
+                options=["poem", "chronicle", "short_story"],
+                format_func=lambda item: genre_card_options[item]["name"],
+                key="antese_daily_lit_genre",
+            )
+            lit_mood = lit_col2.selectbox(
+                "Clima",
+                options=["intimo", "melancolico", "noturno", "estranho", "terno", "seco"],
+                key="antese_daily_lit_mood",
+            )
+            lit_length = lit_col3.selectbox(
+                "Tamanho",
+                options=["muito curto", "curto", "médio"],
+                key="antese_daily_lit_length",
+            )
+            lit_form = st.selectbox(
+                "Forma",
+                options=["livre", "fragmentado", "mais narrativo", "mais lírico", "mais contido"],
+                key="antese_daily_lit_form",
+            )
+
+            st.markdown("**Sugestões do seu universo de escrita**")
+            suggestion_cols = st.columns(4)
+            for index, term in enumerate(LITERARY_DAILY_SUGGESTIONS):
+                if suggestion_cols[index % 4].button(term, key=f"lit_term_{term}", use_container_width=True):
+                    _append_daily_suggestion("antese_daily_lit_seeds", term)
+                    st.rerun()
+
+            lit_seeds = st.text_input(
+                "Palavras, imagens ou disparadores",
+                key="antese_daily_lit_seeds",
+                placeholder="Ex.: janela molhada, corredor vazio, máquina cansada, gato dormindo",
+            )
+            lit_sensory = st.text_area(
+                "Sensações / cenas",
+                key="antese_daily_lit_sensory",
+                placeholder="Ex.: sensação de suspensão, luz azul, silêncio espesso, desejo de desaparecer.",
+                height=120,
+            )
+            lit_opening = st.text_input(
+                "Frase inicial opcional",
+                key="antese_daily_lit_opening",
+                placeholder="Ex.: A noite parecia mastigar devagar o barulho da rua.",
+            )
+            literary_inspiration_options = ["", "essayistic", "aphoristic", "intimate_reflective"]
+            lit_inspiration = st.selectbox(
+                "Inclinação estilística",
+                options=literary_inspiration_options,
+                format_func=lambda item: "Sem inclinação extra" if not item else inspiration_options[item]["name"],
+                key="antese_daily_lit_inspiration",
+            )
+
+            if st.button("Gerar faísca literária", type="primary", use_container_width=True):
+                if not lit_seeds.strip() and not lit_sensory.strip():
+                    st.warning("Adicione ao menos algumas palavras ou sensações para disparar a escrita.")
+                else:
+                    daily_payload = _build_literary_daily_payload(
+                        default_style_profile=default_style_profile,
+                        genre_id=lit_genre_id,
+                        inspiration_profile_id=lit_inspiration or "intimate_reflective",
+                        seeds_text=lit_seeds,
+                        sensory_text=lit_sensory,
+                        opening_line=lit_opening,
+                        mood=lit_mood,
+                        length_pref=lit_length,
+                        form_pref=lit_form,
+                    )
+                    _run_antese_from_payload(daily_payload, "Antese está escrevendo sua faísca literária...")
+                    st.session_state["last_antese_daily_response"] = st.session_state.get("last_antese_response")
+
+        else:
+            data_col1, data_col2 = st.columns(2)
+            data_topic = data_col1.text_input(
+                "Tema",
+                key="antese_daily_data_topic",
+                placeholder="Ex.: agentes, RAG, qualidade de dados, analytics engineering",
+            )
+            data_thesis = data_col2.text_input(
+                "Tese ou pergunta",
+                key="antese_daily_data_thesis",
+                placeholder="Ex.: por que a maioria dos agentes falha mais por estrutura do que por modelo?",
+            )
+            data_angle = st.text_input(
+                "Ângulo",
+                key="antese_daily_data_angle",
+                placeholder="Ex.: visão prática para times pequenos e produtos internos",
+            )
+            data_col3, data_col4, data_col5 = st.columns(3)
+            data_audience = data_col3.selectbox(
+                "Público",
+                options=["profissionais de dados", "público técnico misto", "liderança", "iniciantes em IA"],
+                key="antese_daily_data_audience",
+            )
+            data_format = data_col4.selectbox(
+                "Formato",
+                options=["Artigo Medium", "Artigo opinativo", "Explicação técnica", "Reflexão aplicada"],
+                key="antese_daily_data_format",
+            )
+            data_tone = data_col5.selectbox(
+                "Tom",
+                options=["analítico e claro", "ensaístico e técnico", "didático e objetivo", "provocativo e bem fundamentado"],
+                key="antese_daily_data_tone",
+            )
+
+            st.markdown("**Sugestões temáticas**")
+            data_suggestion_cols = st.columns(4)
+            for index, term in enumerate(DATA_ARTICLE_SUGGESTIONS):
+                if data_suggestion_cols[index % 4].button(term, key=f"data_term_{term}", use_container_width=True):
+                    _append_daily_suggestion("antese_daily_data_concepts", term)
+                    st.rerun()
+
+            data_concepts = st.text_area(
+                "Conceitos obrigatórios",
+                key="antese_daily_data_concepts",
+                placeholder="Ex.: contexto, avaliação, orquestração, custo, latência",
+                height=100,
+            )
+            data_notes = st.text_area(
+                "Notas rápidas",
+                key="antese_daily_data_notes",
+                placeholder="Cole bullets, exemplos, argumentos ou observações do dia.",
+                height=140,
+            )
+            data_inspiration = st.selectbox(
+                "Inclinação estilística",
+                options=["", "essayistic", "journalistic"],
+                format_func=lambda item: "Sem inclinação extra" if not item else inspiration_options[item]["name"],
+                key="antese_daily_data_inspiration",
+            )
+
+            if st.button("Gerar artigo Data/IA", type="primary", use_container_width=True):
+                if not data_topic.strip():
+                    st.warning("Defina pelo menos o tema do artigo.")
+                else:
+                    workspace_profile = "workspace_specific" if "workspace_specific" in style_profile_options else default_style_profile
+                    daily_payload = _build_data_article_payload(
+                        workspace_style_profile=workspace_profile,
+                        inspiration_profile_id=data_inspiration or "essayistic",
+                        topic=data_topic,
+                        thesis=data_thesis,
+                        angle=data_angle,
+                        audience=data_audience,
+                        article_format=data_format,
+                        tone=data_tone,
+                        concepts_text=data_concepts,
+                        notes_text=data_notes,
+                    )
+                    _run_antese_from_payload(daily_payload, "Antese está montando seu artigo sobre Data/IA...")
+                    st.session_state["last_antese_daily_response"] = st.session_state.get("last_antese_response")
+
+        daily_response = st.session_state.get("last_antese_daily_response")
+        if daily_response:
+            st.markdown("**Resultado rápido**")
+            daily_out_col1, daily_out_col2 = st.columns([2, 1])
+            with daily_out_col1:
+                st.write(daily_response.get("output_text", ""))
+            with daily_out_col2:
+                st.markdown("**Estrutura**")
+                st.code(daily_response.get("outline_text", ""), language="markdown")
+                st.markdown("**Qualidade**")
+                st.json(daily_response.get("quality_report", {}))
 
     with brief_tab:
         user_request = st.text_area(
